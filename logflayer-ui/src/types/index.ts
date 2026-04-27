@@ -16,6 +16,10 @@ export interface Target {
   log_dirs?: string[]
   connection?: Record<string, unknown>
   credentials?: Record<string, unknown>
+  /** How many lines to sample per file. Overrides global SAMPLE_LINE_COUNT. */
+  sample_line_count?: number
+  /** Max files to discover per log directory. Overrides global REMOTE_MAX_FILES_PER_TARGET. */
+  max_files?: number
   [key: string]: unknown
 }
 

@@ -65,6 +65,34 @@
       <p class="text-[rgba(245,245,220,0.30)] text-xs mt-1">Path on the logflayer host machine.</p>
     </div>
 
+    <!-- Sampling controls -->
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <label class="block text-xs font-medium text-[rgba(245,245,220,0.60)] mb-1">
+          Lines per sample
+          <span class="text-[rgba(245,245,220,0.30)] font-normal ml-1">(default: 50)</span>
+        </label>
+        <input
+          v-model.number="form.sample_line_count"
+          type="number" min="1" max="10000"
+          class="input"
+          placeholder="50"
+        />
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-[rgba(245,245,220,0.60)] mb-1">
+          Max files per directory
+          <span class="text-[rgba(245,245,220,0.30)] font-normal ml-1">(default: 100)</span>
+        </label>
+        <input
+          v-model.number="form.max_files"
+          type="number" min="1" max="10000"
+          class="input"
+          placeholder="100"
+        />
+      </div>
+    </div>
+
     <!-- Log paths -->
     <div>
       <label class="block text-xs font-medium text-[rgba(245,245,220,0.60)] mb-1">Log Paths</label>
@@ -130,14 +158,16 @@ function detectAuthMethod(t?: Target | null) {
 const authMethod = ref(detectAuthMethod(props.initial))
 
 const form = reactive<Partial<Target> & { host?: string; username?: string; password?: string; private_key?: string; private_key_path?: string }>({
-  target_id:        props.initial?.target_id        ?? '',
-  host:             (props.initial as any)?.host || (props.initial as any)?.hostname || '',
-  port:             (props.initial as any)?.port     ?? 22,
-  username:         (props.initial as any)?.username || (props.initial as any)?.user || '',
-  password:         (props.initial as any)?.password || props.initial?.credentials?.password || '',
-  private_key:      (props.initial as any)?.private_key || props.initial?.credentials?.private_key || '',
-  private_key_path: (props.initial as any)?.private_key_path || props.initial?.credentials?.private_key_path || '',
-  status:           props.initial?.status ?? 'active',
+  target_id:         props.initial?.target_id         ?? '',
+  host:              (props.initial as any)?.host || (props.initial as any)?.hostname || '',
+  port:              (props.initial as any)?.port      ?? 22,
+  username:          (props.initial as any)?.username || (props.initial as any)?.user || '',
+  password:          (props.initial as any)?.password || props.initial?.credentials?.password || '',
+  private_key:       (props.initial as any)?.private_key || props.initial?.credentials?.private_key || '',
+  private_key_path:  (props.initial as any)?.private_key_path || props.initial?.credentials?.private_key_path || '',
+  status:            props.initial?.status ?? 'active',
+  sample_line_count: props.initial?.sample_line_count ?? undefined,
+  max_files:         props.initial?.max_files         ?? undefined,
 })
 
 const logPathsText = ref(
@@ -150,11 +180,13 @@ watch(() => props.initial, (t) => {
   form.host             = (t as any)?.host || (t as any)?.hostname || ''
   form.port             = (t as any)?.port     ?? 22
   form.username         = (t as any)?.username || (t as any)?.user || ''
-  form.password         = (t as any)?.password || t?.credentials?.password || ''
-  form.private_key      = (t as any)?.private_key || t?.credentials?.private_key || ''
-  form.private_key_path = (t as any)?.private_key_path || t?.credentials?.private_key_path || ''
-  form.status           = t?.status ?? 'active'
-  logPathsText.value    = ((t as any)?.log_paths || (t as any)?.log_dirs || []).join('\n')
+  form.password          = (t as any)?.password || t?.credentials?.password || ''
+  form.private_key       = (t as any)?.private_key || t?.credentials?.private_key || ''
+  form.private_key_path  = (t as any)?.private_key_path || t?.credentials?.private_key_path || ''
+  form.status            = t?.status ?? 'active'
+  form.sample_line_count = t?.sample_line_count ?? undefined
+  form.max_files         = t?.max_files         ?? undefined
+  logPathsText.value     = ((t as any)?.log_paths || (t as any)?.log_dirs || []).join('\n')
 })
 
 function submit() {
@@ -170,6 +202,11 @@ function submit() {
   if (authMethod.value === 'password')   payload.password         = form.password
   if (authMethod.value === 'key_inline') payload.private_key      = form.private_key
   if (authMethod.value === 'key_path')   payload.private_key_path = form.private_key_path
+  // Only include sampling overrides when explicitly set (leave absent = use global defaults)
+  if (form.sample_line_count && form.sample_line_count > 0)
+    payload.sample_line_count = form.sample_line_count
+  if (form.max_files && form.max_files > 0)
+    payload.max_files = form.max_files
 
   emit('save', payload as Partial<Target>)
 }

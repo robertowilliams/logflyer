@@ -76,6 +76,10 @@ fn inspect_target(
     let sampler = build_sampler(sampling.mode);
     let mut results = Vec::new();
 
+    // Per-target overrides take precedence over global config values.
+    let effective_line_count = target.sample_line_count.unwrap_or(sampling.line_count);
+    let effective_max_files = target.max_files.unwrap_or(discovery.max_files_per_target);
+
     for directory in &target.log_paths {
         if !directory_exists(&executor, directory)? {
             results.push(SampleDraft {
@@ -93,7 +97,7 @@ fn inspect_target(
             continue;
         }
 
-        let files = match find_files(&executor, directory, &discovery) {
+        let files = match find_files(&executor, directory, &discovery, effective_max_files) {
             Ok(files) => files,
             Err(error) => {
                 results.push(SampleDraft {
@@ -134,7 +138,7 @@ fn inspect_target(
                 &*sampler,
                 &target,
                 &file,
-                sampling.line_count,
+                effective_line_count,
                 sampling.mode,
             ));
         }
@@ -280,6 +284,7 @@ fn find_files(
     executor: &dyn RemoteCommandExecutor,
     directory: &str,
     discovery: &DiscoveryConfig,
+    max_files: usize,
 ) -> Result<Vec<String>, AppError> {
     // Remote discovery is intentionally delegated to `find` because the target systems
     // are Linux hosts and this keeps network transfer limited to the final sample set.
@@ -300,7 +305,7 @@ fn find_files(
             "find {} -maxdepth {} -type f | head -n {}",
             shell_quote(directory),
             discovery.max_depth,
-            discovery.max_files_per_target
+            max_files,
         )
     } else {
         format!(
@@ -308,7 +313,7 @@ fn find_files(
             shell_quote(directory),
             discovery.max_depth,
             filter,
-            discovery.max_files_per_target
+            max_files,
         )
     };
 

@@ -33,6 +33,12 @@ pub struct RawTargetDocument {
     pub log_paths: Option<Vec<String>>,
     pub connection: Option<RawConnection>,
     pub credentials: Option<RawCredentials>,
+    /// Per-target override: how many lines to sample from each log file.
+    /// Falls back to the global `SAMPLE_LINE_COUNT` env var when absent.
+    pub sample_line_count: Option<u32>,
+    /// Per-target override: max number of files to discover per log directory.
+    /// Falls back to the global `REMOTE_MAX_FILES_PER_TARGET` env var when absent.
+    pub max_files: Option<u32>,
 }
 
 impl RawTargetDocument {
@@ -88,6 +94,10 @@ pub struct ValidatedTarget {
     pub username: String,
     pub auth: AuthMethod,
     pub log_paths: Vec<String>,
+    /// Overrides `SamplingConfig::line_count` for this target only.
+    pub sample_line_count: Option<usize>,
+    /// Overrides `DiscoveryConfig::max_files_per_target` for this target only.
+    pub max_files: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +204,8 @@ impl ValidatedTarget {
                 username: username.expect("validated username"),
                 auth: auth_method.expect("validated auth"),
                 log_paths,
+                sample_line_count: raw.sample_line_count.map(|v| v as usize),
+                max_files: raw.max_files.map(|v| v as usize),
             })
         } else {
             Err(errors)
