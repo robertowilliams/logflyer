@@ -3,3 +3,6 @@ target
 .github
 .env
 logs
+logflayer-ui/node_modules
+logflayer-ui/dist
+secret_manager
