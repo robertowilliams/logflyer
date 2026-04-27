@@ -52,17 +52,17 @@
     </div>
 
     <!-- Content drawer -->
-    <div v-if="selected !== null && store.samples[selected]" class="card bg-[#0a0a0a] border-[#dc143c]/30">
+    <div v-if="selected !== null && store.samples[selected] != null" class="card bg-[#0a0a0a] border-[#dc143c]/30">
       <div class="flex justify-between items-center mb-3">
         <div>
           <span class="text-[rgba(245,245,220,0.80)] font-semibold text-sm">Sample Content</span>
-          <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ store.samples[selected].source_file }}</span>
+          <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ store.samples[selected!].source_file }}</span>
         </div>
         <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors">✕</button>
       </div>
-      <pre class="text-xs text-[#00d4ff] overflow-x-auto whitespace-pre-wrap max-h-80">{{ store.samples[selected].sample_content }}</pre>
-      <div v-if="store.samples[selected].error_details" class="mt-3 text-[#ff6b8a] text-xs">
-        Error: {{ store.samples[selected].error_details }}
+      <pre class="text-xs text-[#00d4ff] overflow-x-auto whitespace-pre-wrap max-h-80">{{ store.samples[selected!].sample_content }}</pre>
+      <div v-if="store.samples[selected!].error_details" class="mt-3 text-[#ff6b8a] text-xs">
+        Error: {{ store.samples[selected!].error_details }}
       </div>
     </div>
 

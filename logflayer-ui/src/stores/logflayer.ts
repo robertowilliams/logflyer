@@ -55,7 +55,7 @@ export const useLogflayerStore = defineStore('logflayer', () => {
   async function toggleTarget(id: string) {
     const res = await client.toggleTarget(id)
     const idx = targets.value.findIndex(t => t.id === id)
-    if (idx !== -1) targets.value[idx].status = res.status
+    if (idx !== -1) targets.value[idx]!.status = res.status
   }
 
   async function fetchLogs(lines = 200) {

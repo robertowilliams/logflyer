@@ -190,7 +190,7 @@ watch(() => props.initial, (t) => {
 })
 
 function submit() {
-  const log_paths = logPathsText.value.split('\n').map(s => s.trim()).filter(Boolean)
+  const log_paths = logPathsText.value.split('\n').map((s: string) => s.trim()).filter(Boolean)
   const payload: Record<string, unknown> = {
     target_id: form.target_id,
     host:      form.host,
