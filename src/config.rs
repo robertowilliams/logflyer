@@ -17,15 +17,9 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone)]
 pub struct PreprocessingConfig {
-    /// Run the preprocessing pipeline after each new sample is stored.
     pub enabled: bool,
-    /// Minimum fraction of lines that must match an agentic pattern before the
-    /// sample is flagged as worth classifying (0.0 – 1.0).
     pub agentic_threshold: f64,
-    /// Maximum number of lines examined when extracting the log schema.
     pub max_schema_lines: usize,
-    /// TCP port for the Prometheus `/metrics` HTTP listener.
-    /// Set to 0 to disable the listener entirely.
     pub metrics_port: u16,
 }
 
@@ -35,6 +29,8 @@ pub struct MongoConfig {
     pub source_db_name: String,
     pub source_collection_name: String,
     pub destination_db_name: String,
+    pub tracking_db_name: String,
+    pub tracking_collection_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +60,8 @@ pub struct ServiceConfig {
     pub poll_interval_secs: u64,
     pub concurrency: usize,
     pub ssh_timeout_secs: u64,
+    /// TCP port for the REST API server. Set to 0 to disable.
+    pub api_port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -84,14 +82,17 @@ pub struct LoggingConfig {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        // The service uses `.env` as its single configuration surface so deployments can
-        // promote the same binary through environments without rebuilding.
         Ok(Self {
             mongo: MongoConfig {
                 uri: required("MONGODB_URI")?,
                 source_db_name: with_default("SOURCE_DB_NAME", "vectadb"),
                 source_collection_name: with_default("SOURCE_COLLECTION_NAME", "ai_targets"),
                 destination_db_name: with_default("DESTINATION_DB_NAME", "log_samples"),
+                tracking_db_name: with_default("TRACKING_DB_NAME", "loggingtracker"),
+                tracking_collection_name: with_default(
+                    "TRACKING_COLLECTION_NAME",
+                    "logging_tracks",
+                ),
             },
             sampling: SamplingConfig {
                 mode: parse_sampling_mode(&with_default("SAMPLE_MODE", "both"))?,
@@ -102,6 +103,7 @@ impl AppConfig {
                 poll_interval_secs: positive_u64("POLL_INTERVAL_SECS", 300)?,
                 concurrency: positive_usize("CONCURRENCY", 4)?,
                 ssh_timeout_secs: positive_u64("SSH_TIMEOUT_SECS", 15)?,
+                api_port: optional_u16("API_PORT", 8080)?,
             },
             discovery: DiscoveryConfig {
                 max_depth: positive_usize("REMOTE_MAX_DEPTH", 3)?,
@@ -141,11 +143,9 @@ fn positive_usize(name: &str, default: usize) -> Result<usize, ConfigError> {
     let parsed = raw
         .parse::<usize>()
         .map_err(|_| ConfigError::InvalidVar(name.to_string(), raw.clone()))?;
-
     if parsed == 0 {
         return Err(ConfigError::InvalidVar(name.to_string(), raw));
     }
-
     Ok(parsed)
 }
 
@@ -154,11 +154,9 @@ fn positive_u64(name: &str, default: u64) -> Result<u64, ConfigError> {
     let parsed = raw
         .parse::<u64>()
         .map_err(|_| ConfigError::InvalidVar(name.to_string(), raw.clone()))?;
-
     if parsed == 0 {
         return Err(ConfigError::InvalidVar(name.to_string(), raw));
     }
-
     Ok(parsed)
 }
 
@@ -178,8 +176,6 @@ fn parse_sampling_mode(value: &str) -> Result<SamplingMode, ConfigError> {
         .ok_or_else(|| ConfigError::InvalidVar("SAMPLE_MODE".to_string(), value.to_string()))
 }
 
-/// Public re-export so `main.rs` can read one-off boolean env vars without
-/// duplicating the parsing logic.
 pub fn bool_flag_pub(name: &str, default: bool) -> bool {
     bool_flag(name, default)
 }
@@ -202,16 +198,12 @@ fn positive_f64(name: &str, default: f64) -> Result<f64, ConfigError> {
     let parsed = raw
         .parse::<f64>()
         .map_err(|_| ConfigError::InvalidVar(name.to_string(), raw.clone()))?;
-
     if parsed <= 0.0 || !parsed.is_finite() {
         return Err(ConfigError::InvalidVar(name.to_string(), raw));
     }
-
     Ok(parsed)
 }
 
-/// Parse a u16 env var.  Returns the default when the variable is unset.
-/// 0 is a valid value here (it disables the listener).
 fn optional_u16(name: &str, default: u16) -> Result<u16, ConfigError> {
     match env::var(name) {
         Err(_) => Ok(default),
@@ -222,8 +214,6 @@ fn optional_u16(name: &str, default: u16) -> Result<u16, ConfigError> {
 }
 
 fn parse_patterns(value: &str) -> Vec<String> {
-    // Discovery patterns are configured as a comma-separated list so operators can
-    // widen or narrow the search without touching code.
     value
         .split(',')
         .map(str::trim)

@@ -6,6 +6,7 @@ description = "Rust microservice for sampling logs from remote Linux hosts and s
 license = "MIT"
 
 [dependencies]
+axum = { version = "0.7", features = ["macros"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 dotenvy = "0.15"
 file-rotate = "0.7"
@@ -22,6 +23,7 @@ sha2 = "0.10"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 thiserror = "1.0"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tower-http = { version = "0.5", features = ["cors"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

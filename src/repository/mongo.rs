@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use mongodb::bson::{self, doc, Bson, Document};
+use mongodb::bson::{self, doc, Bson, DateTime, Document};
 use mongodb::error::Error as MongoError;
-use mongodb::options::{ClientOptions, FindOptions, IndexOptions, ReplaceOptions};
+use mongodb::options::{
+    ClientOptions, FindOptions, IndexOptions, ReplaceOptions, FindOneAndReplaceOptions,
+};
 use mongodb::{Client, Collection, Database, IndexModel};
+use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::config::MongoConfig;
@@ -22,7 +25,9 @@ pub struct MongoRepository {
     client: Client,
     source_database: Database,
     destination_database: Database,
+    tracking_database: Database,
     source_collection_name: String,
+    tracking_collection_name: String,
     indexed_collections: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -34,12 +39,15 @@ impl MongoRepository {
         let client = Client::with_options(options)?;
         let source_database = client.database(&config.source_db_name);
         let destination_database = client.database(&config.destination_db_name);
+        let tracking_database = client.database(&config.tracking_db_name);
 
         Ok(Self {
             client,
             source_database,
             destination_database,
+            tracking_database,
             source_collection_name: config.source_collection_name.clone(),
+            tracking_collection_name: config.tracking_collection_name.clone(),
             indexed_collections: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -52,17 +60,17 @@ impl MongoRepository {
         Ok(())
     }
 
+    // ─── Sampling service methods ─────────────────────────────────────────────
+
     pub async fn fetch_active_targets(&self) -> Result<Vec<Document>, AppError> {
         let collection = self
             .source_database
             .collection::<Document>(&self.source_collection_name);
         let mut cursor = collection.find(doc! {"status": "active"}, None).await?;
         let mut documents = Vec::new();
-
         while cursor.advance().await? {
             documents.push(cursor.deserialize_current()?);
         }
-
         Ok(documents)
     }
 
@@ -71,11 +79,8 @@ impl MongoRepository {
         collection_name: &str,
         sample: &SampleRecord,
     ) -> Result<StoreOutcome, AppError> {
-        // Each target writes into its own collection so data can be isolated, queried,
-        // or retained independently per remote system.
         self.ensure_indexes(collection_name).await?;
         let collection = self.destination_collection(collection_name);
-
         match collection.insert_one(sample.to_document(), None).await {
             Ok(_) => Ok(StoreOutcome::Inserted),
             Err(error) if is_duplicate_key_error(&error) => Ok(StoreOutcome::Duplicate),
@@ -90,10 +95,7 @@ impl MongoRepository {
                 return Ok(());
             }
         }
-
         let collection = self.destination_collection(collection_name);
-        // Deduplication is enforced by MongoDB itself through a unique hash index. That
-        // keeps repeated polling idempotent even when multiple service instances run.
         let unique_hash_index = IndexModel::builder()
             .keys(doc! { "sample_hash": 1 })
             .options(
@@ -103,7 +105,6 @@ impl MongoRepository {
                     .build(),
             )
             .build();
-
         let timestamp_index = IndexModel::builder()
             .keys(doc! { "timestamp": -1, "source_file": 1 })
             .options(
@@ -112,76 +113,47 @@ impl MongoRepository {
                     .build(),
             )
             .build();
-
         collection.create_index(unique_hash_index, None).await?;
         collection.create_index(timestamp_index, None).await?;
-
         let mut guard = self.indexed_collections.lock().await;
         guard.insert(collection_name.to_string());
         Ok(())
     }
 
-    /// Upsert a [`SampleMetadata`] document into the shared `sample_metadata`
-    /// collection, keyed by `sample_hash`.
-    ///
-    /// Using `replace_one` with `upsert: true` means a re-run of the
-    /// preprocessor on the same sample will overwrite the old metadata rather
-    /// than accumulating duplicates.
     pub async fn store_metadata(&self, metadata: &SampleMetadata) -> Result<(), AppError> {
         self.ensure_metadata_indexes().await?;
-
         let document = metadata.to_document()?;
         let filter = doc! { "sample_hash": &metadata.sample_hash };
         let options = ReplaceOptions::builder().upsert(true).build();
-
         self.destination_database
             .collection::<Document>("sample_metadata")
             .replace_one(filter, document, options)
             .await?;
-
         Ok(())
     }
 
-    /// Fetch up to `limit` sample records whose preprocessing has not yet been
-    /// completed.
-    ///
-    /// "Unprocessed" is defined as having no corresponding document in the
-    /// `sample_metadata` collection.  This method performs the anti-join in
-    /// application code rather than with a `$lookup` to keep the query simple
-    /// and compatible with all MongoDB deployments.
-    ///
-    /// For large backlogs a future iteration should push this into a server-side
-    /// aggregation, but for the initial implementation the fetch-then-filter
-    /// approach is adequate.
     pub async fn fetch_unprocessed_samples(
         &self,
         limit: usize,
     ) -> Result<Vec<SampleRecord>, AppError> {
-        // Collect the hashes that already have metadata.
         let processed_hashes: HashSet<String> = {
             let meta_col = self
                 .destination_database
                 .collection::<Document>("sample_metadata");
-
             let opts = FindOptions::builder()
                 .projection(doc! { "sample_hash": 1, "_id": 0 })
                 .build();
-
             let mut cursor = meta_col.find(doc! {}, opts).await?;
             let mut hashes = HashSet::new();
-
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 if let Some(Bson::String(hash)) = doc.get("sample_hash") {
                     hashes.insert(hash.clone());
                 }
             }
-
             hashes
         };
 
-        // Scan each per-target collection in the destination database and
-        // collect unprocessed records.
         let collection_names = self.destination_database.list_collection_names(None).await?;
         let mut unprocessed = Vec::new();
 
@@ -189,7 +161,6 @@ impl MongoRepository {
             if name == "sample_metadata" {
                 continue;
             }
-
             let col = self.destination_database.collection::<Document>(&name);
             let mut cursor = col
                 .find(
@@ -204,40 +175,32 @@ impl MongoRepository {
                 if unprocessed.len() >= limit {
                     break 'outer;
                 }
-
                 let document = cursor.deserialize_current()?;
                 let hash = match document.get("sample_hash") {
                     Some(Bson::String(h)) => h.clone(),
                     _ => continue,
                 };
-
                 if processed_hashes.contains(&hash) {
                     continue;
                 }
-
-                // Reconstruct a minimal SampleRecord from the stored document.
                 if let Ok(record) = bson::from_document::<SampleRecord>(document) {
                     unprocessed.push(record);
                 }
             }
         }
-
         Ok(unprocessed)
     }
 
     async fn ensure_metadata_indexes(&self) -> Result<(), AppError> {
-        // Guard: only create the indexes once per process lifetime.
         {
             let guard = self.indexed_collections.lock().await;
             if guard.contains("sample_metadata") {
                 return Ok(());
             }
         }
-
         let col = self
             .destination_database
             .collection::<Document>("sample_metadata");
-
         let unique_hash = IndexModel::builder()
             .keys(doc! { "sample_hash": 1 })
             .options(
@@ -247,7 +210,6 @@ impl MongoRepository {
                     .build(),
             )
             .build();
-
         let target_time = IndexModel::builder()
             .keys(doc! { "target_id": 1, "analyzed_at": -1 })
             .options(
@@ -256,7 +218,6 @@ impl MongoRepository {
                     .build(),
             )
             .build();
-
         let worth_classifying = IndexModel::builder()
             .keys(doc! { "ingestion_hints.worth_classifying": 1 })
             .options(
@@ -265,32 +226,19 @@ impl MongoRepository {
                     .build(),
             )
             .build();
-
         col.create_index(unique_hash, None).await?;
         col.create_index(target_time, None).await?;
         col.create_index(worth_classifying, None).await?;
-
         let mut guard = self.indexed_collections.lock().await;
         guard.insert("sample_metadata".to_string());
-
         Ok(())
     }
 
-    /// Delete all `SampleMetadata` documents whose `preprocessing_version` does
-    /// not match `current_version`.  The backfill loop will subsequently
-    /// re-process those samples because they will no longer appear in
-    /// `fetch_unprocessed_samples`'s anti-join exclusion set.
-    ///
-    /// Returns the number of documents deleted.
     pub async fn delete_stale_metadata(&self, current_version: &str) -> Result<u64, AppError> {
         let col = self
             .destination_database
             .collection::<Document>("sample_metadata");
-
-        let filter = doc! {
-            "preprocessing_version": { "$ne": current_version }
-        };
-
+        let filter = doc! { "preprocessing_version": { "$ne": current_version } };
         let result = col.delete_many(filter, None).await?;
         Ok(result.deleted_count)
     }
@@ -299,6 +247,255 @@ impl MongoRepository {
         self.destination_database
             .collection::<Document>(collection_name)
     }
+
+    // ─── API methods ──────────────────────────────────────────────────────────
+
+    /// List all target documents regardless of status.
+    pub async fn list_all_targets(&self) -> Result<Vec<JsonValue>, AppError> {
+        let col = self
+            .source_database
+            .collection::<Document>(&self.source_collection_name);
+        let opts = FindOptions::builder()
+            .sort(doc! { "target_id": 1 })
+            .build();
+        let mut cursor = col.find(doc! {}, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            let doc = cursor.deserialize_current()?;
+            out.push(bson_doc_to_json(doc));
+        }
+        Ok(out)
+    }
+
+    /// Insert a new target document.
+    pub async fn create_target(&self, body: JsonValue) -> Result<JsonValue, AppError> {
+        let col = self
+            .source_database
+            .collection::<Document>(&self.source_collection_name);
+        let mut doc = json_to_bson_doc(body)?;
+        // Default status to "active" if not provided.
+        if !doc.contains_key("status") {
+            doc.insert("status", "active");
+        }
+        let result = col.insert_one(doc.clone(), None).await?;
+        if let Some(id) = result.inserted_id.as_object_id() {
+            doc.insert("_id", id);
+        }
+        Ok(bson_doc_to_json(doc))
+    }
+
+    /// Replace a target document identified by its string `_id`.
+    pub async fn update_target(&self, id: &str, body: JsonValue) -> Result<JsonValue, AppError> {
+        use mongodb::bson::oid::ObjectId;
+        let oid = ObjectId::parse_str(id)
+            .map_err(|e| AppError::Validation(format!("invalid id: {e}")))?;
+        let col = self
+            .source_database
+            .collection::<Document>(&self.source_collection_name);
+        let replacement = json_to_bson_doc(body)?;
+        let opts = FindOneAndReplaceOptions::builder()
+            .return_document(mongodb::options::ReturnDocument::After)
+            .build();
+        let updated = col
+            .find_one_and_replace(doc! { "_id": oid }, replacement, opts)
+            .await?
+            .ok_or_else(|| AppError::Validation(format!("target {id} not found")))?;
+        Ok(bson_doc_to_json(updated))
+    }
+
+    /// Delete a target document by its string `_id`.
+    pub async fn delete_target(&self, id: &str) -> Result<(), AppError> {
+        use mongodb::bson::oid::ObjectId;
+        let oid = ObjectId::parse_str(id)
+            .map_err(|e| AppError::Validation(format!("invalid id: {e}")))?;
+        let col = self
+            .source_database
+            .collection::<Document>(&self.source_collection_name);
+        col.delete_one(doc! { "_id": oid }, None).await?;
+        Ok(())
+    }
+
+    /// Toggle a target's status between "active" and "inactive".
+    pub async fn toggle_target_status(&self, id: &str) -> Result<String, AppError> {
+        use mongodb::bson::oid::ObjectId;
+        let oid = ObjectId::parse_str(id)
+            .map_err(|e| AppError::Validation(format!("invalid id: {e}")))?;
+        let col = self
+            .source_database
+            .collection::<Document>(&self.source_collection_name);
+
+        let current = col
+            .find_one(doc! { "_id": oid }, None)
+            .await?
+            .ok_or_else(|| AppError::Validation(format!("target {id} not found")))?;
+
+        let current_status = current
+            .get_str("status")
+            .unwrap_or("inactive");
+        let new_status = if current_status.eq_ignore_ascii_case("active") {
+            "inactive"
+        } else {
+            "active"
+        };
+
+        col.update_one(
+            doc! { "_id": oid },
+            doc! { "$set": { "status": new_status } },
+            None,
+        )
+        .await?;
+
+        Ok(new_status.to_string())
+    }
+
+    /// List all per-target sample collections in the destination database.
+    pub async fn list_sample_collections(&self) -> Result<Vec<String>, AppError> {
+        let mut names = self
+            .destination_database
+            .list_collection_names(None)
+            .await?;
+        names.retain(|n| n != "sample_metadata");
+        names.sort();
+        Ok(names)
+    }
+
+    /// Fetch a paginated page of sample records, optionally filtered by target.
+    pub async fn fetch_samples_page(
+        &self,
+        target_id: Option<&str>,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let skip = page * limit as u64;
+
+        if let Some(tid) = target_id {
+            // Single collection
+            let col = self.destination_database.collection::<Document>(tid);
+            let opts = FindOptions::builder()
+                .sort(doc! { "timestamp": -1 })
+                .skip(skip)
+                .limit(limit)
+                .build();
+            let total = col.count_documents(doc! {}, None).await?;
+            let mut cursor = col.find(doc! {}, opts).await?;
+            let mut out = Vec::new();
+            while cursor.advance().await? {
+                out.push(bson_doc_to_json(cursor.deserialize_current()?));
+            }
+            return Ok((out, total));
+        }
+
+        // Across all collections
+        let names = self.list_sample_collections().await?;
+        let mut all: Vec<JsonValue> = Vec::new();
+        let mut total: u64 = 0;
+
+        for name in &names {
+            let col = self.destination_database.collection::<Document>(name);
+            total += col.count_documents(doc! {}, None).await?;
+            let opts = FindOptions::builder()
+                .sort(doc! { "timestamp": -1 })
+                .limit(limit)
+                .build();
+            let mut cursor = col.find(doc! {}, opts).await?;
+            while cursor.advance().await? {
+                all.push(bson_doc_to_json(cursor.deserialize_current()?));
+            }
+        }
+
+        // Sort combined results by timestamp desc, then paginate
+        all.sort_by(|a, b| {
+            let ta = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            tb.cmp(ta)
+        });
+        let page_slice = all
+            .into_iter()
+            .skip(skip as usize)
+            .take(limit as usize)
+            .collect();
+
+        Ok((page_slice, total))
+    }
+
+    /// Fetch paginated records from `loggingtracker.logging_tracks`.
+    pub async fn fetch_tracking_logs(
+        &self,
+        limit: i64,
+        page: u64,
+        search: Option<&str>,
+        level: Option<&str>,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self
+            .tracking_database
+            .collection::<Document>(&self.tracking_collection_name);
+
+        let mut filter = doc! {};
+        if let Some(lvl) = level {
+            if !lvl.is_empty() {
+                filter.insert("level", lvl);
+            }
+        }
+        if let Some(q) = search {
+            if !q.is_empty() {
+                filter.insert(
+                    "message",
+                    doc! { "$regex": q, "$options": "i" },
+                );
+            }
+        }
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let skip = page * limit as u64;
+        let opts = FindOptions::builder()
+            .sort(doc! { "timestamp": -1 })
+            .skip(skip)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+
+        Ok((out, total))
+    }
+}
+
+// ─── BSON ↔ JSON helpers ──────────────────────────────────────────────────────
+
+fn bson_doc_to_json(doc: Document) -> JsonValue {
+    // Convert ObjectId to string so the frontend can use it as a plain id field.
+    let mut map = serde_json::Map::new();
+    for (k, v) in doc {
+        let key = if k == "_id" { "id".to_string() } else { k };
+        map.insert(key, bson_to_json(v));
+    }
+    JsonValue::Object(map)
+}
+
+fn bson_to_json(v: Bson) -> JsonValue {
+    match v {
+        Bson::ObjectId(oid) => JsonValue::String(oid.to_hex()),
+        Bson::String(s) => JsonValue::String(s),
+        Bson::Boolean(b) => JsonValue::Bool(b),
+        Bson::Int32(i) => JsonValue::Number(i.into()),
+        Bson::Int64(i) => JsonValue::Number(i.into()),
+        Bson::Double(d) => serde_json::Number::from_f64(d)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Bson::DateTime(dt) => JsonValue::String(dt.to_string()),
+        Bson::Array(arr) => JsonValue::Array(arr.into_iter().map(bson_to_json).collect()),
+        Bson::Document(doc) => bson_doc_to_json(doc),
+        Bson::Null => JsonValue::Null,
+        other => JsonValue::String(other.to_string()),
+    }
+}
+
+fn json_to_bson_doc(v: JsonValue) -> Result<Document, AppError> {
+    bson::to_document(&v)
+        .map_err(|e| AppError::Validation(format!("failed to convert JSON to BSON: {e}")))
 }
 
 fn is_duplicate_key_error(error: &MongoError) -> bool {
