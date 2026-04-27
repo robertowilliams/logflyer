@@ -1,0 +1,20 @@
+{"time":"2026-04-26T10:00:01Z","level":"info","msg":"Starting LangChain agent","agent_id":"agent-001","session_id":"sess-abc123"}
+{"time":"2026-04-26T10:00:01Z","level":"debug","msg":"PromptTemplate rendered","template":"react","input_variables":["input","agent_scratchpad"]}
+{"time":"2026-04-26T10:00:02Z","level":"info","msg":"AgentExecutor running","tool_count":3,"max_iterations":10}
+{"time":"2026-04-26T10:00:02Z","level":"debug","msg":"Thought: I need to search for the current weather","agent_id":"agent-001"}
+{"time":"2026-04-26T10:00:02Z","level":"info","msg":"tool_call","tool_name":"search","tool_input":"current weather in San Francisco"}
+{"time":"2026-04-26T10:00:03Z","level":"info","msg":"tool_result","tool_name":"search","output":"Partly cloudy, 18°C"}
+{"time":"2026-04-26T10:00:03Z","level":"debug","msg":"Observation: Partly cloudy, 18°C"}
+{"time":"2026-04-26T10:00:03Z","level":"info","msg":"openai chat.completions request","model":"gpt-4o","prompt_tokens":512,"completion_tokens":128}
+{"time":"2026-04-26T10:00:04Z","level":"info","msg":"finish_reason: stop","usage":{"prompt_tokens":512,"completion_tokens":128,"total_tokens":640}}
+{"time":"2026-04-26T10:00:04Z","level":"info","msg":"Final Answer: The weather in San Francisco is partly cloudy at 18°C","agent_id":"agent-001"}
+{"time":"2026-04-26T10:00:04Z","level":"info","msg":"AgentExecutor finished","iterations":2,"total_tokens":640}
+{"time":"2026-04-26T10:00:05Z","level":"info","msg":"LLMChain completed","chain_id":"chain-xyz","duration_ms":2841}
+{"time":"2026-04-26T10:00:05Z","level":"debug","msg":"ConversationChain memory updated","messages":4}
+{"time":"2026-04-26T10:00:05Z","level":"info","msg":"tool_call","tool_name":"calculator","tool_input":"18 * 1.8 + 32"}
+{"time":"2026-04-26T10:00:06Z","level":"info","msg":"tool_result","tool_name":"calculator","output":"64.4"}
+{"time":"2026-04-26T10:00:06Z","level":"info","msg":"Final Answer: 18°C is 64.4°F","agent_id":"agent-001"}
+{"time":"2026-04-26T10:00:06Z","level":"info","msg":"Session complete","session_id":"sess-abc123","total_tool_calls":2}
+{"time":"2026-04-26T10:00:07Z","level":"info","msg":"BaseTool invoked","tool":"search","run_id":"run-001"}
+{"time":"2026-04-26T10:00:07Z","level":"debug","msg":"vector_store similarity_search","query":"weather forecast","k":5}
+{"time":"2026-04-26T10:00:08Z","level":"info","msg":"Retrieval augmented context built","chunk_count":3,"total_tokens":384}

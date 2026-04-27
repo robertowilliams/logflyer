@@ -1,0 +1,26 @@
+2026-04-26 10:00:01 INFO  Invoking Bedrock model anthropic.claude-3-sonnet
+2026-04-26 10:00:01 DEBUG invoke_model request_id=req-bedrock-001 region=us-east-1
+2026-04-26 10:00:02 ERROR InvokeModel failed: ThrottlingException
+Traceback (most recent call last):
+  File "/app/agent/bedrock_client.py", line 84, in invoke
+    response = self.client.invoke_model(**params)
+  File "/usr/lib/python3.11/site-packages/botocore/client.py", line 565, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+  File "/usr/lib/python3.11/site-packages/botocore/client.py", line 1021, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (ThrottlingException) when calling the InvokeModel operation: Too many requests
+2026-04-26 10:00:02 INFO  Retry 1/3 after exponential backoff 2s
+2026-04-26 10:00:04 INFO  invoke_model retry succeeded request_id=req-bedrock-002
+2026-04-26 10:00:04 DEBUG prompt_tokens=780 completion_tokens=210 total_tokens=990
+2026-04-26 10:00:04 INFO  Agent tool_call search_web query="latest quarterly earnings"
+2026-04-26 10:00:05 INFO  tool_result search_web status=ok result_count=5
+2026-04-26 10:00:05 INFO  chain_step "Analyze search results" agent_id=bedrock-agent-007
+2026-04-26 10:00:06 ERROR Context length exceeded: 200000 token limit
+Traceback (most recent call last):
+  File "/app/agent/context_manager.py", line 112, in trim_context
+    raise ContextLimitError(f"Context window exceeded: {token_count} > {limit}")
+ContextLimitError: Context window exceeded: 201438 > 200000
+2026-04-26 10:00:06 WARN  Trimming oldest messages from context window
+2026-04-26 10:00:07 INFO  invoke_model after trim request_id=req-bedrock-003
+2026-04-26 10:00:07 DEBUG total_tokens=145000 after trim
+2026-04-26 10:00:08 INFO  Final Answer generated agent_id=bedrock-agent-007 confidence=0.92

@@ -1,0 +1,20 @@
+time=2026-04-26T10:00:00Z level=info msg="CrewAI crew starting" crew_id=crew-42 agent_count=3
+time=2026-04-26T10:00:00Z level=debug msg="Agent initialised" agent=researcher role="Senior Research Analyst"
+time=2026-04-26T10:00:00Z level=debug msg="Agent initialised" agent=writer role="Tech Content Writer"
+time=2026-04-26T10:00:00Z level=debug msg="Agent initialised" agent=reviewer role="Quality Assurance"
+time=2026-04-26T10:00:01Z level=info msg="crew.kickoff called" task_count=2 verbose=true
+time=2026-04-26T10:00:01Z level=info msg="Task assigned" task_id=task-1 agent=researcher description="Research AI trends 2026"
+time=2026-04-26T10:00:01Z level=debug msg="tool_call" tool=web_search input="AI agent frameworks 2026 trends"
+time=2026-04-26T10:00:02Z level=info msg="tool_result" tool=web_search status=ok results=10
+time=2026-04-26T10:00:02Z level=debug msg="anthropic.claude invoked" model=claude-opus-4 prompt_tokens=1024
+time=2026-04-26T10:00:03Z level=info msg="finish_reason=stop" completion_tokens=512 total_tokens=1536
+time=2026-04-26T10:00:03Z level=info msg="Agent output ready" agent=researcher word_count=450
+time=2026-04-26T10:00:03Z level=info msg="Task assigned" task_id=task-2 agent=writer description="Write blog post"
+time=2026-04-26T10:00:03Z level=debug msg="tool_call" tool=file_writer path="/tmp/blog_post.md"
+time=2026-04-26T10:00:04Z level=info msg="tool_result" tool=file_writer status=ok bytes_written=4096
+time=2026-04-26T10:00:04Z level=info msg="Delegating to reviewer" from=writer to=reviewer handoff=true
+time=2026-04-26T10:00:04Z level=debug msg="anthropic.claude invoked" model=claude-sonnet-4 prompt_tokens=2048
+time=2026-04-26T10:00:05Z level=info msg="finish_reason=stop" completion_tokens=256 total_tokens=2304
+time=2026-04-26T10:00:05Z level=info msg="Review complete" agent=reviewer score=9.2 approved=true
+time=2026-04-26T10:00:05Z level=info msg="crew.kickoff finished" total_tokens=3840 duration_ms=5012
+time=2026-04-26T10:00:05Z level=info msg="Task( crew-42 ) completed successfully"

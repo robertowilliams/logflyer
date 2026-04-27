@@ -1,0 +1,30 @@
+[package]
+name = "logflayer"
+version = "0.1.0"
+edition = "2021"
+description = "Rust microservice for sampling logs from remote Linux hosts and storing the samples in MongoDB."
+license = "MIT"
+
+[dependencies]
+chrono = { version = "0.4", features = ["clock", "serde"] }
+dotenvy = "0.15"
+file-rotate = "0.7"
+futures = "0.3"
+hex = "0.4"
+metrics = "0.22"
+metrics-exporter-prometheus = { version = "0.13", features = ["http-listener"] }
+mongodb = "2.8"
+once_cell = "1.19"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+thiserror = "1.0"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
