@@ -1,7 +1,7 @@
 # ─── Stage 1: dependency cache ───────────────────────────────────────────────
 # Build a throwaway binary using only Cargo manifests so Docker can cache the
 # full dependency compile layer separately from application source changes.
-FROM rust:1.83-bookworm AS deps
+FROM rust:1.86-bookworm AS deps
 
 WORKDIR /app
 
