@@ -7,44 +7,44 @@
   line-height: 1.5;
   font-weight: 400;
   color-scheme: dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #0f172a;
+  color: #f5f5dc;
+  background-color: #0a0a0a;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-body { margin: 0; min-height: 100vh; }
+body { margin: 0; min-height: 100vh; background-color: #0a0a0a; }
 #app  { min-height: 100vh; }
 
 @layer components {
   .card {
-    @apply bg-slate-800 rounded-lg shadow-lg p-6 border border-slate-700;
+    @apply bg-[#141414] rounded-lg shadow-lg p-6 border border-[#dc143c]/20;
   }
   .btn {
-    @apply px-4 py-2 rounded-lg font-medium transition-colors duration-200 cursor-pointer;
+    @apply px-4 py-2 rounded-lg font-medium transition-all duration-200 cursor-pointer;
   }
   .btn-primary {
-    @apply btn bg-primary-600 hover:bg-primary-700 text-white;
+    @apply btn bg-[#dc143c] hover:bg-[#e8173f] text-[#f5f5dc] shadow-[0_0_12px_rgba(220,20,60,0.3)];
   }
   .btn-secondary {
-    @apply btn bg-slate-700 hover:bg-slate-600 text-white;
+    @apply btn bg-[#1a1a1a] hover:bg-[#222222] text-[#f5f5dc] border border-[#dc143c]/30;
   }
   .btn-danger {
-    @apply btn bg-red-700 hover:bg-red-600 text-white;
+    @apply btn bg-[#8b0000] hover:bg-[#dc143c] text-[#f5f5dc];
   }
   .input {
-    @apply w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white
-           placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-primary-500
-           focus:border-transparent;
+    @apply w-full px-3 py-2 bg-[#1a1a1a] border border-[#dc143c]/30 rounded-lg text-[#f5f5dc]
+           placeholder-[rgba(245,245,220,0.40)] focus:outline-none focus:ring-2 focus:ring-[#dc143c]/50
+           focus:border-[#dc143c] transition-colors duration-200;
   }
   .badge {
     @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
   }
-  .badge-green  { @apply badge bg-green-900 text-green-300; }
-  .badge-red    { @apply badge bg-red-900   text-red-300;   }
-  .badge-yellow { @apply badge bg-yellow-900 text-yellow-300; }
-  .badge-blue   { @apply badge bg-blue-900  text-blue-300;  }
-  .badge-slate  { @apply badge bg-slate-700 text-slate-300; }
+  .badge-green  { @apply badge bg-green-950  text-green-400  border border-green-800; }
+  .badge-red    { @apply badge bg-[#5c0010]  text-[#ff6b8a]  border border-[#dc143c]/40; }
+  .badge-yellow { @apply badge bg-yellow-950 text-yellow-400 border border-yellow-800; }
+  .badge-blue   { @apply badge bg-[#00d4ff]/10 text-[#00d4ff] border border-[#00d4ff]/30; }
+  .badge-slate  { @apply badge bg-[#1a1a1a]  text-[rgba(245,245,220,0.60)] border border-[#222222]; }
 }

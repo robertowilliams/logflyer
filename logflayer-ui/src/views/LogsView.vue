@@ -3,7 +3,7 @@
     <!-- Controls -->
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2">
-        <label class="text-slate-400 text-sm">Lines:</label>
+        <label class="text-[rgba(245,245,220,0.50)] text-sm">Lines:</label>
         <select v-model="lineCount" class="input w-28 py-1">
           <option :value="100">100</option>
           <option :value="200">200</option>
@@ -12,11 +12,11 @@
         </select>
       </div>
       <button @click="load" class="btn-primary py-1">↻ Refresh</button>
-      <label class="flex items-center gap-2 text-slate-400 text-sm cursor-pointer">
-        <input type="checkbox" v-model="autoRefresh" class="rounded" />
+      <label class="flex items-center gap-2 text-[rgba(245,245,220,0.50)] text-sm cursor-pointer">
+        <input type="checkbox" v-model="autoRefresh" class="rounded accent-[#dc143c]" />
         Auto-refresh (5s)
       </label>
-      <div v-if="store.logFile" class="text-slate-500 text-xs ml-auto truncate">{{ store.logFile }}</div>
+      <div v-if="store.logFile" class="text-[rgba(245,245,220,0.30)] text-xs ml-auto truncate">{{ store.logFile }}</div>
     </div>
 
     <!-- Filter -->
@@ -25,11 +25,11 @@
     <!-- Log output -->
     <div
       ref="logBox"
-      class="bg-slate-950 border border-slate-700 rounded-lg p-4 font-mono text-xs
+      class="bg-[#0a0a0a] border border-[#dc143c]/20 rounded-lg p-4 font-mono text-xs
              h-[65vh] overflow-y-auto whitespace-pre-wrap leading-5"
     >
-      <div v-if="store.loading && lines.length === 0" class="text-slate-500">Loading…</div>
-      <div v-else-if="lines.length === 0" class="text-slate-500">No log lines found.</div>
+      <div v-if="store.loading && lines.length === 0" class="text-[rgba(245,245,220,0.30)]">Loading…</div>
+      <div v-else-if="lines.length === 0" class="text-[rgba(245,245,220,0.30)]">No log lines found.</div>
       <div
         v-for="(line, i) in lines"
         :key="i"
@@ -37,7 +37,7 @@
       >{{ line }}</div>
     </div>
 
-    <div class="text-slate-500 text-xs">{{ lines.length }} lines shown</div>
+    <div class="text-[rgba(245,245,220,0.30)] text-xs">{{ lines.length }} lines shown</div>
   </div>
 </template>
 
@@ -61,12 +61,12 @@ const lines = computed(() =>
 function lineClass(line: string) {
   const lower = line.toLowerCase()
   if (lower.includes('"level":"error"') || lower.includes('error') || lower.includes('err '))
-    return 'text-red-400'
+    return 'text-[#ff6b8a]'
   if (lower.includes('"level":"warn"') || lower.includes('warn'))
     return 'text-yellow-400'
   if (lower.includes('"level":"debug"') || lower.includes('debug'))
-    return 'text-slate-500'
-  return 'text-green-300'
+    return 'text-[rgba(245,245,220,0.30)]'
+  return 'text-[#00d4ff]'
 }
 
 async function load() {

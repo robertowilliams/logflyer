@@ -7,14 +7,14 @@
         <option v-for="c in store.sampleCollections" :key="c" :value="c">{{ c }}</option>
       </select>
       <button @click="load(1)" class="btn-primary">↻ Refresh</button>
-      <span class="ml-auto text-slate-400 text-sm self-center">{{ store.samplesTotal }} total records</span>
+      <span class="ml-auto text-[rgba(245,245,220,0.40)] text-sm self-center">{{ store.samplesTotal }} total records</span>
     </div>
 
     <!-- Table -->
     <div class="card p-0 overflow-hidden">
       <table class="w-full text-sm">
-        <thead>
-          <tr class="text-slate-400 text-left border-b border-slate-700">
+        <thead class="bg-[#0f0f0f]">
+          <tr class="text-[rgba(245,245,220,0.50)] text-left border-b border-[#dc143c]/20">
             <th class="px-4 py-3">Timestamp</th>
             <th class="px-4 py-3">Target</th>
             <th class="px-4 py-3">Source File</th>
@@ -24,23 +24,25 @@
             <th class="px-4 py-3">Status</th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-slate-700">
-          <tr v-if="store.loading"><td colspan="7" class="px-4 py-6 text-center text-slate-400">Loading…</td></tr>
+        <tbody class="divide-y divide-[#1a1a1a]">
+          <tr v-if="store.loading">
+            <td colspan="7" class="px-4 py-6 text-center text-[rgba(245,245,220,0.40)]">Loading…</td>
+          </tr>
           <tr v-else-if="store.samples.length === 0">
-            <td colspan="7" class="px-4 py-6 text-center text-slate-500">No samples found.</td>
+            <td colspan="7" class="px-4 py-6 text-center text-[rgba(245,245,220,0.30)]">No samples found.</td>
           </tr>
           <tr
             v-for="(s, i) in store.samples"
             :key="i"
-            class="hover:bg-slate-750 transition-colors cursor-pointer"
+            class="hover:bg-[#dc143c]/5 transition-colors cursor-pointer"
             @click="selected = selected === i ? null : i"
           >
-            <td class="px-4 py-2 text-slate-400 text-xs font-mono">{{ fmt(s.timestamp) }}</td>
-            <td class="px-4 py-2 text-primary-300 font-mono text-xs">{{ s.target_id }}</td>
-            <td class="px-4 py-2 text-slate-300 text-xs truncate max-w-xs" :title="s.source_file">{{ s.source_file }}</td>
+            <td class="px-4 py-2 text-[rgba(245,245,220,0.40)] text-xs font-mono">{{ fmt(s.timestamp) }}</td>
+            <td class="px-4 py-2 text-[#dc143c] font-mono text-xs">{{ s.target_id }}</td>
+            <td class="px-4 py-2 text-[rgba(245,245,220,0.70)] text-xs truncate max-w-xs" :title="s.source_file">{{ s.source_file }}</td>
             <td class="px-4 py-2"><span class="badge-blue">{{ s.sampling_mode }}</span></td>
-            <td class="px-4 py-2 text-slate-400">{{ s.line_count ?? '—' }}</td>
-            <td class="px-4 py-2 text-slate-400">{{ fmtSize(s.file_size_bytes) }}</td>
+            <td class="px-4 py-2 text-[rgba(245,245,220,0.50)]">{{ s.line_count ?? '—' }}</td>
+            <td class="px-4 py-2 text-[rgba(245,245,220,0.50)]">{{ fmtSize(s.file_size_bytes) }}</td>
             <td class="px-4 py-2">
               <span :class="statusClass(s.processing_status)">{{ s.processing_status }}</span>
             </td>
@@ -50,22 +52,22 @@
     </div>
 
     <!-- Content drawer -->
-    <div v-if="selected !== null && store.samples[selected]" class="card bg-slate-900">
+    <div v-if="selected !== null && store.samples[selected]" class="card bg-[#0a0a0a] border-[#dc143c]/30">
       <div class="flex justify-between items-center mb-3">
         <div>
-          <span class="text-slate-300 font-semibold text-sm">Sample Content</span>
-          <span class="text-slate-500 text-xs ml-3">{{ store.samples[selected].source_file }}</span>
+          <span class="text-[rgba(245,245,220,0.80)] font-semibold text-sm">Sample Content</span>
+          <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ store.samples[selected].source_file }}</span>
         </div>
-        <button @click="selected = null" class="text-slate-500 hover:text-white">✕</button>
+        <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors">✕</button>
       </div>
-      <pre class="text-xs text-green-300 overflow-x-auto whitespace-pre-wrap max-h-80">{{ store.samples[selected].sample_content }}</pre>
-      <div v-if="store.samples[selected].error_details" class="mt-3 text-red-400 text-xs">
+      <pre class="text-xs text-[#00d4ff] overflow-x-auto whitespace-pre-wrap max-h-80">{{ store.samples[selected].sample_content }}</pre>
+      <div v-if="store.samples[selected].error_details" class="mt-3 text-[#ff6b8a] text-xs">
         Error: {{ store.samples[selected].error_details }}
       </div>
     </div>
 
     <!-- Pagination -->
-    <div class="flex items-center justify-between text-sm text-slate-400">
+    <div class="flex items-center justify-between text-sm text-[rgba(245,245,220,0.40)]">
       <span>Page {{ page }}</span>
       <div class="flex gap-2">
         <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40">← Prev</button>

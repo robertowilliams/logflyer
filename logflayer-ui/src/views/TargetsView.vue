@@ -16,8 +16,8 @@
     <!-- Table -->
     <div class="card p-0 overflow-hidden">
       <table class="w-full text-sm">
-        <thead class="bg-slate-750">
-          <tr class="text-slate-400 text-left border-b border-slate-700">
+        <thead class="bg-[#0f0f0f]">
+          <tr class="text-[rgba(245,245,220,0.50)] text-left border-b border-[#dc143c]/20">
             <th class="px-4 py-3">Target ID</th>
             <th class="px-4 py-3">Host</th>
             <th class="px-4 py-3">Port</th>
@@ -28,26 +28,30 @@
             <th class="px-4 py-3">Actions</th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-slate-700">
-          <tr v-if="store.loading"><td colspan="8" class="px-4 py-6 text-center text-slate-400">Loading…</td></tr>
-          <tr v-else-if="filtered.length === 0"><td colspan="8" class="px-4 py-6 text-center text-slate-500">No targets found.</td></tr>
-          <tr v-for="t in filtered" :key="t.id" class="hover:bg-slate-750 transition-colors">
-            <td class="px-4 py-3 font-mono text-primary-300">{{ t.target_id }}</td>
-            <td class="px-4 py-3 text-slate-300">{{ t.host || t.hostname || t.server || '—' }}</td>
-            <td class="px-4 py-3 text-slate-400">{{ t.port || 22 }}</td>
-            <td class="px-4 py-3 text-slate-400">{{ t.username || t.user || '—' }}</td>
+        <tbody class="divide-y divide-[#1a1a1a]">
+          <tr v-if="store.loading">
+            <td colspan="8" class="px-4 py-6 text-center text-[rgba(245,245,220,0.40)]">Loading…</td>
+          </tr>
+          <tr v-else-if="filtered.length === 0">
+            <td colspan="8" class="px-4 py-6 text-center text-[rgba(245,245,220,0.30)]">No targets found.</td>
+          </tr>
+          <tr v-for="t in filtered" :key="t.id" class="hover:bg-[#dc143c]/5 transition-colors">
+            <td class="px-4 py-3 font-mono text-[#dc143c]">{{ t.target_id }}</td>
+            <td class="px-4 py-3 text-[rgba(245,245,220,0.80)]">{{ t.host || t.hostname || t.server || '—' }}</td>
+            <td class="px-4 py-3 text-[rgba(245,245,220,0.50)]">{{ t.port || 22 }}</td>
+            <td class="px-4 py-3 text-[rgba(245,245,220,0.50)]">{{ t.username || t.user || '—' }}</td>
             <td class="px-4 py-3">
               <span class="badge-blue">{{ authLabel(t) }}</span>
             </td>
-            <td class="px-4 py-3 text-slate-400">{{ (t.log_paths || t.log_dirs || []).length }}</td>
+            <td class="px-4 py-3 text-[rgba(245,245,220,0.50)]">{{ (t.log_paths || t.log_dirs || []).length }}</td>
             <td class="px-4 py-3">
               <span :class="t.status === 'active' ? 'badge-green' : 'badge-red'">{{ t.status }}</span>
             </td>
             <td class="px-4 py-3">
               <div class="flex gap-2">
-                <button @click="openEdit(t)" class="text-primary-400 hover:text-primary-300 text-xs">Edit</button>
-                <button @click="toggle(t.id)" class="text-yellow-400 hover:text-yellow-300 text-xs">Toggle</button>
-                <button @click="remove(t.id)" class="text-red-400 hover:text-red-300 text-xs">Delete</button>
+                <button @click="openEdit(t)" class="text-[#00d4ff] hover:text-[#00b8d9] text-xs transition-colors">Edit</button>
+                <button @click="toggle(t.id)" class="text-yellow-400 hover:text-yellow-300 text-xs transition-colors">Toggle</button>
+                <button @click="remove(t.id)" class="text-[#ff6b8a] hover:text-[#dc143c] text-xs transition-colors">Delete</button>
               </div>
             </td>
           </tr>
@@ -56,10 +60,10 @@
     </div>
 
     <!-- Modal -->
-    <div v-if="showModal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-      <div class="bg-slate-800 border border-slate-600 rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+    <div v-if="showModal" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+      <div class="bg-[#141414] border border-[#dc143c]/30 rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-[0_0_40px_rgba(220,20,60,0.2)]">
         <div class="p-6">
-          <h2 class="text-lg font-semibold mb-6">{{ editingTarget ? 'Edit Target' : 'New Target' }}</h2>
+          <h2 class="text-lg font-semibold mb-6 text-[#f5f5dc]">{{ editingTarget ? 'Edit Target' : 'New Target' }}</h2>
           <TargetForm :initial="editingTarget" @save="onSave" @cancel="closeModal" />
         </div>
       </div>
