@@ -24,8 +24,8 @@ FROM deps AS builder
 
 COPY src ./src
 
-# Touch main.rs so cargo knows the real source changed.
-RUN touch src/main.rs \
+# Touch all source files so cargo recompiles the real library, not the stub.
+RUN find src -name "*.rs" -exec touch {} + \
     && cargo build --release
 
 # ─── Stage 3: minimal runtime image ──────────────────────────────────────────
