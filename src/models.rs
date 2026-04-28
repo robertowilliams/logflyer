@@ -570,3 +570,94 @@ fn is_valid_collection_name(value: &str) -> bool {
         && !value.contains('$')
         && !value.starts_with("system.")
 }
+
+// ─── LLM Classification ───────────────────────────────────────────────────────
+
+/// Severity level assigned by the LLM classifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Critical,
+    Warning,
+    Info,
+    Normal,
+}
+
+impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Critical => "critical",
+            Severity::Warning  => "warning",
+            Severity::Info     => "info",
+            Severity::Normal   => "normal",
+        }
+    }
+
+    /// Numeric priority for threshold comparisons (higher = more severe).
+    pub fn level(&self) -> u8 {
+        match self {
+            Severity::Normal   => 0,
+            Severity::Info     => 1,
+            Severity::Warning  => 2,
+            Severity::Critical => 3,
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "critical" => Severity::Critical,
+            "warning"  => Severity::Warning,
+            "info"     => Severity::Info,
+            _          => Severity::Normal,
+        }
+    }
+}
+
+/// A single notable pattern extracted from the log sample by the classifier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Finding {
+    /// Short label for the pattern, e.g. "repeated auth failure".
+    pub pattern:  String,
+    /// Number of occurrences in the sample window.
+    pub count:    u32,
+    /// Per-finding severity ("critical", "warning", "info").
+    pub severity: String,
+    /// One verbatim log line that best illustrates the pattern.
+    pub example:  String,
+}
+
+/// Full LLM classification result stored in the `classifications` collection.
+///
+/// Keyed by `sample_hash` — same key as `SampleRecord` and `SampleMetadata` —
+/// so all three documents can be joined without a secondary index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationRecord {
+    pub sample_hash:   String,
+    pub target_id:     String,
+    pub classified_at: DateTime,
+    /// Model string used, e.g. `"claude-haiku-4-5-20251001"`.
+    pub model:         String,
+    pub severity:      Severity,
+    /// Broad category tags, e.g. `["error", "anomaly", "performance"]`.
+    pub categories:    Vec<String>,
+    /// 1–3 sentence human-readable summary of what the classifier found.
+    pub summary:       String,
+    pub key_findings:  Vec<Finding>,
+    pub recommendations: Vec<String>,
+    /// Self-reported confidence from the model (0.0 – 1.0).
+    pub confidence:    f64,
+    pub input_tokens:  u32,
+    pub output_tokens: u32,
+    /// Monotonically incremented version string for re-classification tracking.
+    pub classification_version: String,
+}
+
+impl ClassificationRecord {
+    pub fn to_document(&self) -> Result<Document, AppError> {
+        bson::to_document(self).map_err(|error| {
+            AppError::Validation(format!(
+                "failed to serialise ClassificationRecord: {error}"
+            ))
+        })
+    }
+}

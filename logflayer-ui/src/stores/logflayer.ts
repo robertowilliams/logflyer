@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { client } from '../api/client'
-import type { Target, SampleRecord, TrackingRecord, HealthResponse } from '../types'
+import type { Target, SampleRecord, TrackingRecord, HealthResponse, ClassificationRecord } from '../types'
 
 export const useLogflayerStore = defineStore('logflayer', () => {
   const health = ref<HealthResponse | null>(null)
@@ -13,6 +13,8 @@ export const useLogflayerStore = defineStore('logflayer', () => {
   const samples = ref<SampleRecord[]>([])
   const samplesTotal = ref(0)
   const sampleCollections = ref<string[]>([])
+  const classifications = ref<ClassificationRecord[]>([])
+  const classificationsTotal = ref(0)
   const loading = ref(false)
   const error = ref<string | null>(null)
 
@@ -98,16 +100,29 @@ export const useLogflayerStore = defineStore('logflayer', () => {
     } catch { sampleCollections.value = [] }
   }
 
+  async function fetchClassifications(params: { target_id?: string; limit?: number; page?: number }) {
+    try {
+      loading.value = true; error.value = null
+      const res = await client.getClassifications(params)
+      classifications.value = res.records
+      classificationsTotal.value = res.total
+    } catch (e: any) {
+      error.value = e.message
+    } finally { loading.value = false }
+  }
+
   function clearError() { error.value = null }
 
   return {
     health, targets, logLines, logFile,
     trackingRecords, trackingTotal,
     samples, samplesTotal, sampleCollections,
+    classifications, classificationsTotal,
     loading, error,
     isHealthy, activeTargets, inactiveTargets,
     checkHealth, fetchTargets, createTarget, updateTarget, deleteTarget, toggleTarget,
     fetchLogs, fetchTracking, fetchSamples, fetchSampleCollections,
+    fetchClassifications,
     clearError,
   }
 })

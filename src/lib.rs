@@ -1,5 +1,7 @@
 pub mod api;
 pub mod backfill;
+pub mod classification;
+pub mod notification;
 pub mod config;
 pub mod error;
 pub mod logging;

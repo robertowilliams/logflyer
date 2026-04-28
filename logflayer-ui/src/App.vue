@@ -66,11 +66,13 @@ const isHealthy = computed(() => store.isHealthy)
 const currentTitle = computed(() => (route.meta.title as string) || 'Logflayer')
 
 const navLinks = [
-  { to: '/',         icon: '📊', label: 'Dashboard'       },
-  { to: '/targets',  icon: '🎯', label: 'Targets'         },
-  { to: '/logs',     icon: '📋', label: 'Live Logs'       },
-  { to: '/tracking', icon: '🔍', label: 'Logging Tracker' },
-  { to: '/samples',  icon: '🗄️',  label: 'Samples'        },
+  { to: '/',                icon: '📊', label: 'Dashboard'       },
+  { to: '/targets',         icon: '🎯', label: 'Targets'         },
+  { to: '/logs',            icon: '📋', label: 'Live Logs'       },
+  { to: '/tracking',        icon: '🔍', label: 'Logging Tracker' },
+  { to: '/samples',         icon: '🗄️',  label: 'Samples'        },
+  { to: '/classifications', icon: '🧠', label: 'Classifications' },
+  { to: '/admin',           icon: '⚙️', label: 'Admin Settings'  },
 ]
 
 onMounted(async () => {

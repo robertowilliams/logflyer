@@ -1,7 +1,8 @@
 import axios, { type AxiosInstance } from 'axios'
 import type {
   Target, SampleRecord, TrackingRecord, HealthResponse,
-  PagedResponse, TargetsResponse,
+  PagedResponse, TargetsResponse, ClassificationRecord,
+  AdminSettings, SettingsResponse,
 } from '../types'
 
 class LogflayerClient {
@@ -66,6 +67,35 @@ class LogflayerClient {
 
   async getSampleCollections(): Promise<{ collections: string[] }> {
     const { data } = await this.http.get('/api/v1/samples/collections')
+    return data
+  }
+
+  // ── Classifications ───────────────────────────────────────────────────────
+  async getClassifications(params: {
+    target_id?: string; limit?: number; page?: number
+  }): Promise<PagedResponse<ClassificationRecord>> {
+    const { data } = await this.http.get('/api/v1/classifications', { params })
+    return data
+  }
+
+  // ── Admin settings ────────────────────────────────────────────────────────
+  async getAdminSettings(): Promise<SettingsResponse> {
+    const { data } = await this.http.get('/api/v1/admin/settings')
+    return data
+  }
+
+  async saveAdminSettings(settings: AdminSettings): Promise<{ saved: boolean; restart_required: boolean }> {
+    const { data } = await this.http.put('/api/v1/admin/settings', settings)
+    return data
+  }
+
+  async fetchModels(
+    baseUrl: string,
+    apiKey: string,
+  ): Promise<{ ok: boolean; models: string[]; error?: string }> {
+    const { data } = await this.http.get('/api/v1/admin/models', {
+      params: { base_url: baseUrl || undefined, api_key: apiKey || undefined },
+    })
     return data
   }
 }

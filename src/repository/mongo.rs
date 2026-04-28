@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::config::MongoConfig;
 use crate::error::AppError;
-use crate::models::{SampleMetadata, SampleRecord};
+use crate::models::{ClassificationRecord, ClassificationStatus, SampleMetadata, SampleRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {
@@ -418,6 +418,237 @@ impl MongoRepository {
         Ok((page_slice, total))
     }
 
+    // ─── Classification methods ───────────────────────────────────────────────
+
+    /// Upsert a ClassificationRecord into the `classifications` collection.
+    pub async fn store_classification(
+        &self,
+        record: &ClassificationRecord,
+    ) -> Result<(), AppError> {
+        self.ensure_classifications_indexes().await?;
+        let doc = record.to_document()?;
+        let filter = doc! { "sample_hash": &record.sample_hash };
+        let opts = ReplaceOptions::builder().upsert(true).build();
+        self.destination_database
+            .collection::<Document>("classifications")
+            .replace_one(filter, doc, opts)
+            .await?;
+        Ok(())
+    }
+
+    /// Set `classification_status` on the matching `sample_metadata` document.
+    pub async fn update_classification_status(
+        &self,
+        hash: &str,
+        status: ClassificationStatus,
+    ) -> Result<(), AppError> {
+        self.destination_database
+            .collection::<Document>("sample_metadata")
+            .update_one(
+                doc! { "sample_hash": hash },
+                doc! { "$set": { "classification_status": status.as_str() } },
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Paginated list of classifications, optionally filtered by target.
+    pub async fn fetch_classifications_page(
+        &self,
+        target_id: Option<&str>,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>("classifications");
+
+        let filter = if let Some(tid) = target_id {
+            doc! { "target_id": tid }
+        } else {
+            doc! {}
+        };
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let skip = page * limit as u64;
+        let opts = FindOptions::builder()
+            .sort(doc! { "classified_at": -1 })
+            .skip(skip)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
+    }
+
+    /// Fetch samples whose metadata marks them as pending classification.
+    ///
+    /// Returns pairs of `(SampleRecord, SampleMetadata)` for the caller to
+    /// classify.  Only includes samples where `worth_classifying = true`,
+    /// `signal_score >= threshold`, and `classification_status = "pending"`.
+    pub async fn fetch_pending_classifications(
+        &self,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<(SampleRecord, SampleMetadata)>, AppError> {
+        let meta_col = self
+            .destination_database
+            .collection::<Document>("sample_metadata");
+
+        let filter = doc! {
+            "ingestion_hints.worth_classifying": true,
+            "agentic_scan.signal_score": { "$gte": threshold },
+            "classification_status": "pending",
+        };
+        let opts = FindOptions::builder()
+            .sort(doc! { "agentic_scan.signal_score": -1 })
+            .limit(limit as i64)
+            .build();
+
+        let mut cursor = meta_col.find(filter, opts).await?;
+        let mut results = Vec::new();
+
+        while cursor.advance().await? {
+            let meta_doc = cursor.deserialize_current()?;
+
+            // Extract target_id and sample_hash to look up the SampleRecord.
+            let target_id = match meta_doc.get("target_id") {
+                Some(Bson::String(s)) => s.clone(),
+                _ => continue,
+            };
+            let sample_hash = match meta_doc.get("sample_hash") {
+                Some(Bson::String(s)) => s.clone(),
+                _ => continue,
+            };
+
+            // Deserialise the metadata document.
+            let metadata = match bson::from_document::<SampleMetadata>(meta_doc) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // Look up the SampleRecord in the per-target collection.
+            let sample_col = self
+                .destination_database
+                .collection::<Document>(&target_id);
+            let sample_doc = match sample_col
+                .find_one(doc! { "sample_hash": &sample_hash }, None)
+                .await?
+            {
+                Some(d) => d,
+                None => continue,
+            };
+            let sample = match bson::from_document::<SampleRecord>(sample_doc) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            results.push((sample, metadata));
+        }
+        Ok(results)
+    }
+
+    /// Fetch a single classification by its sample_hash.
+    pub async fn find_classification_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>("classifications");
+        match col.find_one(doc! { "sample_hash": hash }, None).await? {
+            Some(doc) => Ok(Some(bson_doc_to_json(doc))),
+            None => Ok(None),
+        }
+    }
+
+    async fn ensure_classifications_indexes(&self) -> Result<(), AppError> {
+        {
+            let guard = self.indexed_collections.lock().await;
+            if guard.contains("classifications") {
+                return Ok(());
+            }
+        }
+        let col = self
+            .destination_database
+            .collection::<Document>("classifications");
+
+        let unique_hash = IndexModel::builder()
+            .keys(doc! { "sample_hash": 1 })
+            .options(
+                IndexOptions::builder()
+                    .name(Some("unique_classification_hash".to_string()))
+                    .unique(Some(true))
+                    .build(),
+            )
+            .build();
+        let target_idx = IndexModel::builder()
+            .keys(doc! { "target_id": 1 })
+            .options(IndexOptions::builder().name(Some("cl_target_id".to_string())).build())
+            .build();
+        let time_idx = IndexModel::builder()
+            .keys(doc! { "classified_at": -1 })
+            .options(IndexOptions::builder().name(Some("cl_classified_at".to_string())).build())
+            .build();
+        let severity_idx = IndexModel::builder()
+            .keys(doc! { "severity": 1 })
+            .options(IndexOptions::builder().name(Some("cl_severity".to_string())).build())
+            .build();
+
+        col.create_index(unique_hash, None).await?;
+        col.create_index(target_idx, None).await?;
+        col.create_index(time_idx, None).await?;
+        col.create_index(severity_idx, None).await?;
+
+        let mut guard = self.indexed_collections.lock().await;
+        guard.insert("classifications".to_string());
+        Ok(())
+    }
+
+    // ─── Admin settings ───────────────────────────────────────────────────────
+
+    /// Load the singleton admin-settings document from `app_settings`.
+    pub async fn load_admin_settings(
+        &self,
+    ) -> Result<Option<crate::config::AdminSettings>, AppError> {
+        let col: mongodb::Collection<Document> =
+            self.destination_database.collection("app_settings");
+        match col.find_one(doc! { "_id": "global" }, None).await? {
+            None => Ok(None),
+            Some(mut d) => {
+                d.remove("_id");
+                let settings = bson::from_document::<crate::config::AdminSettings>(d)
+                    .map_err(|e| {
+                        AppError::Validation(format!(
+                            "failed to deserialize admin settings: {e}"
+                        ))
+                    })?;
+                Ok(Some(settings))
+            }
+        }
+    }
+
+    /// Upsert the singleton admin-settings document into `app_settings`.
+    pub async fn save_admin_settings(
+        &self,
+        settings: &crate::config::AdminSettings,
+    ) -> Result<(), AppError> {
+        let col: mongodb::Collection<Document> =
+            self.destination_database.collection("app_settings");
+        let mut doc = bson::to_document(settings)
+            .map_err(|e| AppError::Validation(format!("failed to serialize admin settings: {e}")))?;
+        doc.insert("_id", "global");
+        let filter = doc! { "_id": "global" };
+        let opts = ReplaceOptions::builder().upsert(true).build();
+        col.replace_one(filter, doc, opts).await?;
+        Ok(())
+    }
+
     /// Fetch paginated records from `loggingtracker.logging_tracks`.
     pub async fn fetch_tracking_logs(
         &self,
@@ -485,7 +716,7 @@ fn bson_to_json(v: Bson) -> JsonValue {
         Bson::Double(d) => serde_json::Number::from_f64(d)
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
-        Bson::DateTime(dt) => JsonValue::String(dt.to_string()),
+        Bson::DateTime(dt) => JsonValue::String(dt.to_rfc3339_string()),
         Bson::Array(arr) => JsonValue::Array(arr.into_iter().map(bson_to_json).collect()),
         Bson::Document(doc) => bson_doc_to_json(doc),
         Bson::Null => JsonValue::Null,

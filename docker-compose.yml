@@ -28,6 +28,7 @@ services:
       retries: 3
     networks:
       - logflayer_net
+      - tool_default                   # Reach pdfnumbering-mongodb by container name
 
   # ── Vue UI served by nginx ───────────────────────────────────────────────────
   logflayer-ui:
@@ -51,3 +52,5 @@ volumes:
 networks:
   logflayer_net:
     driver: bridge
+  tool_default:
+    external: true                     # Pre-existing network hosting pdfnumbering-mongodb

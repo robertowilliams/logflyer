@@ -17,6 +17,12 @@ pub enum AppError {
     Validation(String),
     #[error("task join error: {0}")]
     Join(String),
+    #[error("classification error: {0}")]
+    Classification(String),
+    #[error("http error: {0}")]
+    Http(String),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Error)]

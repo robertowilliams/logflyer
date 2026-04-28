@@ -33,6 +33,18 @@ const router = createRouter({
       component: () => import('../views/SamplesView.vue'),
       meta: { title: 'Samples Explorer' },
     },
+    {
+      path: '/classifications',
+      name: 'classifications',
+      component: () => import('../views/ClassificationsView.vue'),
+      meta: { title: 'Classifications' },
+    },
+    {
+      path: '/admin',
+      name: 'admin',
+      component: () => import('../views/AdminView.vue'),
+      meta: { title: 'Admin Settings' },
+    },
   ],
 })
 

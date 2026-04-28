@@ -1,14 +1,18 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{extract::State, Json, Router};
+use tokio::sync::Notify;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::config::AppConfig;
 use crate::repository::MongoRepository;
 
+pub mod admin;
+pub mod classifications;
 pub mod logs;
 pub mod samples;
 pub mod targets;
@@ -20,6 +24,8 @@ pub mod tracking;
 pub struct ApiState {
     pub repo: MongoRepository,
     pub config: AppConfig,
+    /// Poke this to trigger an immediate sampling cycle from the service loop.
+    pub sample_trigger: Arc<Notify>,
 }
 
 pub type SharedState = Arc<ApiState>;
@@ -40,6 +46,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/tracking", get(tracking::list))
         .route("/api/v1/samples", get(samples::list))
         .route("/api/v1/samples/collections", get(samples::collections))
+        .route("/api/v1/sample", post(trigger_sample_handler))
+        .route("/api/v1/classifications", get(classifications::list))
+        .route("/api/v1/classifications/:hash", get(classifications::get_one))
+        .route("/api/v1/admin/settings", get(admin::get_settings).put(admin::put_settings))
+        .route("/api/v1/admin/models",   get(admin::get_models))
         .layer(CorsLayer::permissive())
         .with_state(shared)
 }
@@ -53,6 +64,14 @@ async fn health_handler(State(state): State<SharedState>) -> Json<serde_json::Va
         "mongodb": if ok { "connected" } else { "unreachable" },
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+// ─── Manual sample trigger ────────────────────────────────────────────────────
+
+async fn trigger_sample_handler(State(state): State<SharedState>) -> StatusCode {
+    info!("manual sample trigger received via API");
+    state.sample_trigger.notify_one();
+    StatusCode::ACCEPTED
 }
 
 // ─── Server startup ───────────────────────────────────────────────────────────

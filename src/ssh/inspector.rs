@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,8 +52,6 @@ fn inspect_target(
     discovery: DiscoveryConfig,
     timeout: Duration,
 ) -> Result<Vec<SampleDraft>, AppError> {
-    // SSH work runs on a blocking thread because the ssh2 crate is synchronous. The
-    // async runtime stays free to schedule MongoDB and orchestration tasks.
     let session = match connect_session(&target, timeout) {
         Ok(session) => session,
         Err(error) => {
@@ -76,7 +74,6 @@ fn inspect_target(
     let sampler = build_sampler(sampling.mode);
     let mut results = Vec::new();
 
-    // Per-target overrides take precedence over global config values.
     let effective_line_count = target.sample_line_count.unwrap_or(sampling.line_count);
     let effective_max_files = target.max_files.unwrap_or(discovery.max_files_per_target);
 
@@ -155,8 +152,6 @@ fn sample_file(
     line_count: usize,
     mode: crate::sampling::SamplingMode,
 ) -> SampleDraft {
-    // Metadata is collected separately from the sample body so failures still carry
-    // useful context such as file size or line count when available.
     let file_size_bytes = query_u64(executor, &format!("stat -c %s {}", shell_quote(file)));
     let remote_line_count = query_u64(executor, &format!("wc -l < {}", shell_quote(file)));
 
@@ -199,8 +194,6 @@ fn sample_file(
 
 fn connect_session(target: &ValidatedTarget, timeout: Duration) -> Result<Session, AppError> {
     let socket = resolve_socket(&target.host, target.port)?;
-    // Timeouts are applied to the TCP stream before the SSH handshake so network stalls
-    // fail fast instead of pinning a worker thread indefinitely.
     let tcp = TcpStream::connect_timeout(&socket, timeout).map_err(|error| {
         AppError::Ssh(format!(
             "failed to connect to {}:{}: {error}",
@@ -221,6 +214,7 @@ fn connect_session(target: &ValidatedTarget, timeout: Duration) -> Result<Sessio
         AuthMethod::Password { password } => session
             .userauth_password(&target.username, password)
             .map_err(|error| AppError::Ssh(format!("password authentication failed: {error}")))?,
+
         AuthMethod::PrivateKeyPath {
             private_key_path,
             passphrase,
@@ -234,19 +228,39 @@ fn connect_session(target: &ValidatedTarget, timeout: Duration) -> Result<Sessio
             .map_err(|error| {
                 AppError::Ssh(format!("private key authentication failed: {error}"))
             })?,
+
+        // libssh2 < 1.11 (Debian bookworm ships 1.10) does not support the
+        // OpenSSH wire format ("-----BEGIN OPENSSH PRIVATE KEY-----") in
+        // userauth_pubkey_memory. Writing the key to a temp file and calling
+        // userauth_pubkey_file works with all key types on all libssh2 versions.
         AuthMethod::PrivateKeyInline {
             private_key,
             passphrase,
-        } => session
-            .userauth_pubkey_memory(&target.username, None, private_key, passphrase.as_deref())
-            .map_err(|error| {
-                AppError::Ssh(format!("inline private key authentication failed: {error}"))
-            })?,
+        } => {
+            let mut tmp = tempfile::NamedTempFile::new().map_err(|e| {
+                AppError::Ssh(format!("failed to create temp file for private key: {e}"))
+            })?;
+            tmp.write_all(private_key.as_bytes()).map_err(|e| {
+                AppError::Ssh(format!("failed to write private key to temp file: {e}"))
+            })?;
+            // Flush before passing the path to libssh2.
+            tmp.flush().map_err(|e| {
+                AppError::Ssh(format!("failed to flush private key temp file: {e}"))
+            })?;
+            session
+                .userauth_pubkey_file(
+                    &target.username,
+                    None,
+                    tmp.path(),
+                    passphrase.as_deref(),
+                )
+                .map_err(|error| {
+                    AppError::Ssh(format!("inline private key authentication failed: {error}"))
+                })?;
+            // tmp is dropped here, deleting the file automatically.
+        }
+
         AuthMethod::None => {
-            // No credentials configured — try the SSH agent (picks up any keys
-            // loaded in the running agent). If the agent is unavailable or the
-            // server rejects it, the authenticated() check below will surface a
-            // clear error instead of silently failing.
             let _ = session.userauth_agent(&target.username);
         }
     }
@@ -286,8 +300,6 @@ fn find_files(
     discovery: &DiscoveryConfig,
     max_files: usize,
 ) -> Result<Vec<String>, AppError> {
-    // Remote discovery is intentionally delegated to `find` because the target systems
-    // are Linux hosts and this keeps network transfer limited to the final sample set.
     let filter = if discovery.find_patterns.is_empty() {
         String::new()
     } else {
@@ -347,8 +359,6 @@ impl RemoteCommandExecutor for SessionExecutor<'_> {
             .channel_session()
             .map_err(|error| AppError::Ssh(format!("failed to open SSH channel: {error}")))?;
 
-        // Every command is executed in its own channel so partial failures do not poison
-        // the whole session state for later file operations.
         channel.exec(command).map_err(|error| {
             AppError::Ssh(format!(
                 "failed to execute remote command `{command}`: {error}"

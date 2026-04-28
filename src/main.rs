@@ -9,6 +9,7 @@ use logflayer::metrics;
 use logflayer::preprocessing::PREPROCESSING_VERSION;
 use logflayer::repository::MongoRepository;
 use logflayer::service::Application;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
@@ -28,6 +29,25 @@ async fn run_service() -> Result<(), AppError> {
     let config = AppConfig::from_env()?;
     let _log_guard = init_logging(&config.logging)?;
 
+    // Apply any admin settings persisted in MongoDB on top of the env baseline.
+    let config = match MongoRepository::connect(&config.mongo).await {
+        Ok(repo) => match repo.load_admin_settings().await {
+            Ok(Some(overrides)) => {
+                info!("applying admin settings overrides from MongoDB");
+                config.apply_admin_settings(overrides)
+            }
+            Ok(None) => config,
+            Err(e) => {
+                warn!(error = %e, "could not load admin settings — using env defaults");
+                config
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "could not connect to load admin settings — using env defaults");
+            config
+        }
+    };
+
     if config.preprocessing.metrics_port > 0 {
         metrics::install(config.preprocessing.metrics_port);
     }
@@ -40,13 +60,16 @@ async fn run_service() -> Result<(), AppError> {
         backfill::purge_stale_metadata(&repository, PREPROCESSING_VERSION).await?;
     }
 
-    // Start the REST API server alongside the sampling loop when API_PORT != 0.
+    let app = Application::build(config.clone()).await?;
+
+    // Share the trigger with the API so POST /api/v1/sample fires an immediate cycle.
     if config.service.api_port > 0 {
         let repo = MongoRepository::connect(&config.mongo).await?;
         repo.ping().await?;
         let api_state = ApiState {
             repo,
             config: config.clone(),
+            sample_trigger: app.trigger.clone(),
         };
         let port = config.service.api_port;
         tokio::spawn(async move {
@@ -54,7 +77,6 @@ async fn run_service() -> Result<(), AppError> {
         });
     }
 
-    let app = Application::build(config).await?;
     app.run().await
 }
 
@@ -67,7 +89,7 @@ async fn run_backfill(args: &[String]) -> Result<(), AppError> {
     let mut opts = BackfillOptions {
         batch_size: positive_usize_arg("--batch-size", args).unwrap_or(100),
         dry_run: args.iter().any(|a| a == "--dry-run"),
-        reprocess_stale: args.iter().any(|a| a == "--reprocess-stale"),
+        reprocess_stale: args.iter().any(|a| a == "--reprocess_stale"),
     };
 
     if opts.batch_size == 0 {

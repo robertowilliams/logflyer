@@ -60,7 +60,8 @@
         </div>
         <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors">✕</button>
       </div>
-      <pre class="text-xs text-[#00d4ff] overflow-x-auto whitespace-pre-wrap max-h-80">{{ store.samples[selected!].sample_content }}</pre>
+      <pre v-if="store.samples[selected!].sample_content" class="text-xs text-[#00d4ff] overflow-auto whitespace-pre-wrap max-h-[500px]">{{ store.samples[selected!].sample_content }}</pre>
+      <p v-else class="text-xs text-[rgba(245,245,220,0.30)] italic">No content captured.</p>
       <div v-if="store.samples[selected!].error_details" class="mt-3 text-[#ff6b8a] text-xs">
         Error: {{ store.samples[selected!].error_details }}
       </div>
