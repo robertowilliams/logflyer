@@ -4,13 +4,15 @@ use std::sync::Arc;
 use mongodb::bson::{self, doc, Bson, DateTime, Document};
 use mongodb::error::Error as MongoError;
 use mongodb::options::{
-    ClientOptions, FindOptions, IndexOptions, ReplaceOptions, FindOneAndReplaceOptions,
+    ClientOptions, FindOneAndReplaceOptions, FindOneOptions, FindOptions, IndexOptions,
+    ReplaceOptions,
 };
 use mongodb::{Client, Collection, Database, IndexModel};
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
-use crate::config::MongoConfig;
+use crate::config::{ConfigHistoryConfig, MongoConfig};
+use crate::config_history;
 use crate::error::AppError;
 use crate::models::{ClassificationRecord, ClassificationStatus, SampleMetadata, SampleRecord};
 
@@ -243,6 +245,77 @@ impl MongoRepository {
         Ok(result.deleted_count)
     }
 
+    /// Paginated list of `sample_metadata` documents, optionally filtered by
+    /// `target_id` and/or `worth_classifying`.
+    ///
+    /// Returns `(records_as_json, total_count)`.  Results are sorted by
+    /// `analyzed_at` descending (newest first).
+    pub async fn fetch_metadata_page(
+        &self,
+        target_id: Option<&str>,
+        worth_classifying: Option<bool>,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>("sample_metadata");
+
+        let mut filter = Document::new();
+        if let Some(tid) = target_id {
+            filter.insert("target_id", tid);
+        }
+        if let Some(wc) = worth_classifying {
+            filter.insert("ingestion_hints.worth_classifying", wc);
+        }
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let skip = page * limit as u64;
+        let opts = FindOptions::builder()
+            .sort(doc! { "analyzed_at": -1 })
+            .skip(skip)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
+    }
+
+    /// Fetch a single `sample_metadata` document by its `sample_hash`.
+    ///
+    /// Returns `None` when no document with that hash exists.
+    pub async fn fetch_metadata_by_hash(
+        &self,
+        sample_hash: &str,
+    ) -> Result<Option<JsonValue>, AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>("sample_metadata");
+        match col
+            .find_one(doc! { "sample_hash": sample_hash }, None)
+            .await?
+        {
+            Some(doc) => Ok(Some(bson_doc_to_json(doc))),
+            None => Ok(None),
+        }
+    }
+
+    /// Return a clone of the destination [`Database`] handle.
+    ///
+    /// Use this to construct output adapters such as
+    /// [`crate::output::graph::GraphWriter`] and
+    /// [`crate::output::vector::VectorWriter`], which require direct database
+    /// access for their async write operations.
+    ///
+    /// The handle is cheap to clone — it is backed by an internal `Arc`.
+    pub fn destination_db(&self) -> Database {
+        self.destination_database.clone()
+    }
+
     fn destination_collection(&self, collection_name: &str) -> Collection<Document> {
         self.destination_database
             .collection::<Document>(collection_name)
@@ -315,6 +388,55 @@ impl MongoRepository {
         Ok(())
     }
 
+    /// Delete a sample record (and its metadata) by hash, writing one audit row.
+    ///
+    /// Removes the document from the per-target collection and from
+    /// `sample_metadata`, then inserts one row into `sample_deletions` and
+    /// emits a `warn`-level tracing event so the reason is captured in the
+    /// service log.
+    pub async fn delete_sample(
+        &self,
+        target_id: &str,
+        sample_hash: &str,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        // Remove from per-target collection.
+        self.destination_database
+            .collection::<Document>(target_id)
+            .delete_one(doc! { "sample_hash": sample_hash }, None)
+            .await?;
+
+        // Remove associated metadata (best-effort — ignore if absent).
+        let _ = self
+            .destination_database
+            .collection::<Document>("sample_metadata")
+            .delete_one(doc! { "sample_hash": sample_hash }, None)
+            .await;
+
+        // One audit log row.
+        let log_doc = doc! {
+            "event":       "sample_deleted",
+            "sample_hash": sample_hash,
+            "target_id":   target_id,
+            "reason":      reason,
+            "deleted_at":  DateTime::now(),
+        };
+        let _ = self
+            .destination_database
+            .collection::<Document>("sample_deletions")
+            .insert_one(log_doc, None)
+            .await;
+
+        tracing::warn!(
+            sample_hash,
+            target_id,
+            reason,
+            "sample deleted by operator"
+        );
+
+        Ok(())
+    }
+
     /// Toggle a target's status between "active" and "inactive".
     pub async fn toggle_target_status(&self, id: &str) -> Result<String, AppError> {
         use mongodb::bson::oid::ObjectId;
@@ -348,15 +470,153 @@ impl MongoRepository {
         Ok(new_status.to_string())
     }
 
+    /// Paginated list of deletion audit rows from `sample_deletions`.
+    pub async fn fetch_deletions_page(
+        &self,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>("sample_deletions");
+        let total = col.count_documents(doc! {}, None).await?;
+        let skip = page * limit as u64;
+        let opts = FindOptions::builder()
+            .sort(doc! { "deleted_at": -1 })
+            .skip(skip)
+            .limit(limit)
+            .build();
+        let mut cursor = col.find(doc! {}, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
+    }
+
     /// List all per-target sample collections in the destination database.
     pub async fn list_sample_collections(&self) -> Result<Vec<String>, AppError> {
         let mut names = self
             .destination_database
             .list_collection_names(None)
             .await?;
-        names.retain(|n| n != "sample_metadata");
+        // Exclude all known system / auxiliary collections — only actual
+        // per-target sample buckets should be visible to the API.
+        const SYSTEM_COLLECTIONS: &[&str] = &[
+            "sample_metadata",
+            "sample_deletions",
+            "classifications",
+            "app_settings",
+            "app_settings_history",
+            // UpsideGate output adapter collections.
+            "entity_edges",
+            "prov_relations",
+            "otel_spans",
+            "content_embeddings",
+            "behavioral_embeddings",
+        ];
+        names.retain(|n| !SYSTEM_COLLECTIONS.contains(&n.as_str()));
         names.sort();
         Ok(names)
+    }
+
+    // ─── UpsideGate output reads ──────────────────────────────────────────────
+
+    /// Fetch a page of relation edges, optionally scoped to a single sample.
+    pub async fn fetch_edges_page(
+        &self,
+        sample_hash: Option<&str>,
+        relation_type: Option<&str>,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self.destination_database.collection::<Document>("entity_edges");
+
+        let mut filter = Document::new();
+        if let Some(h) = sample_hash {
+            filter.insert("sample_hash", h);
+        }
+        if let Some(rt) = relation_type {
+            filter.insert("relation_type", rt);
+        }
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let skip = page * limit as u64;
+        let opts = FindOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .skip(skip)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
+    }
+
+    /// Fetch a page of PROV-O triples, optionally filtered.
+    pub async fn fetch_prov_page(
+        &self,
+        sample_hash: Option<&str>,
+        subject: Option<&str>,
+        predicate: Option<&str>,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self.destination_database.collection::<Document>("prov_relations");
+
+        let mut filter = Document::new();
+        if let Some(h) = sample_hash { filter.insert("sample_hash", h); }
+        if let Some(s) = subject     { filter.insert("subject", s); }
+        if let Some(p) = predicate   { filter.insert("predicate", p); }
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let skip = page * limit as u64;
+        let opts = FindOptions::builder()
+            .sort(doc! { "created_at": -1 })
+            .skip(skip)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
+    }
+
+    /// Fetch a page of OTel spans, optionally scoped by sample or trace.
+    pub async fn fetch_spans_page(
+        &self,
+        sample_hash: Option<&str>,
+        trace_id: Option<&str>,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self.destination_database.collection::<Document>("otel_spans");
+
+        let mut filter = Document::new();
+        if let Some(h) = sample_hash { filter.insert("sample_hash", h); }
+        if let Some(t) = trace_id    { filter.insert("trace_id", t); }
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let skip = page * limit as u64;
+        // Sort by start time when available, falling back to insertion order.
+        let opts = FindOptions::builder()
+            .sort(doc! { "start_time_unix_nano": 1 })
+            .skip(skip)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
     }
 
     /// Fetch a paginated page of sample records, optionally filtered by target.
@@ -634,6 +894,8 @@ impl MongoRepository {
     }
 
     /// Upsert the singleton admin-settings document into `app_settings`.
+    /// Sets `_confirmed = true` (used for direct saves that bypass the
+    /// canary-confirmation flow, e.g. rollback restores).
     pub async fn save_admin_settings(
         &self,
         settings: &crate::config::AdminSettings,
@@ -643,10 +905,283 @@ impl MongoRepository {
         let mut doc = bson::to_document(settings)
             .map_err(|e| AppError::Validation(format!("failed to serialize admin settings: {e}")))?;
         doc.insert("_id", "global");
+        doc.insert("_confirmed", true);
+        doc.remove("_previous");
         let filter = doc! { "_id": "global" };
         let opts = ReplaceOptions::builder().upsert(true).build();
         col.replace_one(filter, doc, opts).await?;
         Ok(())
+    }
+
+    /// Upsert admin settings marked as **pending** (awaiting frontend confirmation).
+    /// Stores the previously confirmed settings as `_previous` for rollback.
+    pub async fn save_admin_settings_pending(
+        &self,
+        settings: &crate::config::AdminSettings,
+        previous: Option<crate::config::AdminSettings>,
+    ) -> Result<(), AppError> {
+        let col: mongodb::Collection<Document> =
+            self.destination_database.collection("app_settings");
+        let mut doc = bson::to_document(settings)
+            .map_err(|e| AppError::Validation(format!("failed to serialize admin settings: {e}")))?;
+        doc.insert("_id", "global");
+        doc.insert("_confirmed", false);
+        // Store the rollback target
+        if let Some(prev) = previous {
+            let prev_doc = bson::to_document(&prev).map_err(|e| {
+                AppError::Validation(format!("failed to serialize previous admin settings: {e}"))
+            })?;
+            doc.insert("_previous", prev_doc);
+        } else {
+            doc.remove("_previous");
+        }
+        let filter = doc! { "_id": "global" };
+        let opts = ReplaceOptions::builder().upsert(true).build();
+        col.replace_one(filter, doc, opts).await?;
+        Ok(())
+    }
+
+    /// Mark the current admin settings as confirmed (cancels any pending rollback).
+    pub async fn confirm_admin_settings(&self) -> Result<(), AppError> {
+        let col: mongodb::Collection<Document> =
+            self.destination_database.collection("app_settings");
+        col.update_one(
+            doc! { "_id": "global" },
+            doc! { "$set": { "_confirmed": true }, "$unset": { "_previous": "" } },
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Returns `(confirmed, previous_settings)` from the stored metadata.
+    /// `confirmed = true` when no rollback is pending.
+    pub async fn load_config_pending_meta(
+        &self,
+    ) -> Result<Option<(bool, Option<crate::config::AdminSettings>)>, AppError> {
+        let col: mongodb::Collection<Document> =
+            self.destination_database.collection("app_settings");
+        let doc = match col.find_one(doc! { "_id": "global" }, None).await? {
+            None => return Ok(None),
+            Some(d) => d,
+        };
+        let confirmed = doc.get_bool("_confirmed").unwrap_or(true);
+        let previous = if let Ok(prev_doc) = doc.get_document("_previous") {
+            bson::from_document::<crate::config::AdminSettings>(prev_doc.clone())
+                .ok()
+        } else {
+            None
+        };
+        Ok(Some((confirmed, previous)))
+    }
+
+    /// Restore the `_previous` snapshot as the active config, mark as confirmed,
+    /// and log the rollback event. Returns the restored settings on success.
+    pub async fn rollback_admin_settings(
+        &self,
+        reason: &str,
+    ) -> Result<Option<crate::config::AdminSettings>, AppError> {
+        let col: mongodb::Collection<Document> =
+            self.destination_database.collection("app_settings");
+        let doc = match col.find_one(doc! { "_id": "global" }, None).await? {
+            None => return Ok(None),
+            Some(d) => d,
+        };
+
+        let prev_doc = match doc.get_document("_previous") {
+            Ok(d) => d.clone(),
+            Err(_) => {
+                tracing::warn!("rollback requested but no _previous settings stored");
+                return Ok(None);
+            }
+        };
+
+        let previous: crate::config::AdminSettings =
+            bson::from_document(prev_doc.clone()).map_err(|e| {
+                AppError::Validation(format!(
+                    "failed to deserialize previous admin settings for rollback: {e}"
+                ))
+            })?;
+
+        // Write the previous settings back as the active confirmed config
+        self.save_admin_settings(&previous).await?;
+
+        tracing::warn!(reason, "config rolled back to previous confirmed settings");
+
+        // Write a tracking entry to the destination DB so operators can audit
+        let rollback_doc = doc! {
+            "event":      "config_rollback",
+            "reason":     reason,
+            "rolled_back_at": DateTime::now(),
+        };
+        let _ = self
+            .destination_database
+            .collection::<Document>("app_settings_rollback_log")
+            .insert_one(rollback_doc, None)
+            .await;
+
+        Ok(Some(previous))
+    }
+
+    /// Insert an encrypted, recoverable snapshot of admin settings.
+    pub async fn save_admin_settings_history(
+        &self,
+        settings: &crate::config::AdminSettings,
+        config: &ConfigHistoryConfig,
+        reason: &str,
+    ) -> Result<i64, AppError> {
+        self.ensure_config_history_indexes(&config.collection_name).await?;
+        let col = self
+            .destination_database
+            .collection::<Document>(&config.collection_name);
+
+        let version = self.next_config_history_version(&config.collection_name).await?;
+        let document = config_history::build_history_document(settings, config, version, reason)?;
+        col.insert_one(document, None).await?;
+        Ok(version)
+    }
+
+    async fn next_config_history_version(&self, collection_name: &str) -> Result<i64, AppError> {
+        let col = self.destination_database.collection::<Document>(collection_name);
+        let opts = FindOneOptions::builder()
+            .sort(doc! { "version": -1 })
+            .projection(doc! { "version": 1, "_id": 0 })
+            .build();
+
+        let Some(document) = col.find_one(doc! {}, opts).await? else {
+            return Ok(1);
+        };
+
+        Ok(match document.get("version") {
+            Some(Bson::Int64(value)) => value + 1,
+            Some(Bson::Int32(value)) => i64::from(*value) + 1,
+            _ => 1,
+        })
+    }
+
+    async fn ensure_config_history_indexes(
+        &self,
+        collection_name: &str,
+    ) -> Result<(), AppError> {
+        let index_key = format!("config_history:{collection_name}");
+        {
+            let guard = self.indexed_collections.lock().await;
+            if guard.contains(&index_key) {
+                return Ok(());
+            }
+        }
+
+        let col = self.destination_database.collection::<Document>(collection_name);
+        let version_idx = IndexModel::builder()
+            .keys(doc! { "version": -1 })
+            .options(
+                IndexOptions::builder()
+                    .name(Some("config_history_version".to_string()))
+                    .unique(Some(true))
+                    .build(),
+            )
+            .build();
+        let created_at_idx = IndexModel::builder()
+            .keys(doc! { "created_at": -1 })
+            .options(
+                IndexOptions::builder()
+                    .name(Some("config_history_created_at".to_string()))
+                    .build(),
+            )
+            .build();
+
+        col.create_index(version_idx, None).await?;
+        col.create_index(created_at_idx, None).await?;
+
+        let mut guard = self.indexed_collections.lock().await;
+        guard.insert(index_key);
+        Ok(())
+    }
+
+    /// Return a lightweight list of config-history metadata entries (newest first).
+    /// Each entry contains version, created_at, created_by, source, reason, and
+    /// the encryption key_id — but NOT the settings payload or wrapped keys.
+    pub async fn list_config_history(
+        &self,
+        collection_name: &str,
+        limit: i64,
+    ) -> Result<Vec<Document>, AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>(collection_name);
+
+        let opts = FindOptions::builder()
+            .sort(doc! { "version": -1 })
+            .limit(limit)
+            .projection(doc! {
+                "version":    1,
+                "created_at": 1,
+                "created_by": 1,
+                "source":     1,
+                "reason":     1,
+                "encryption": 1,
+                "_id":        0,
+            })
+            .build();
+
+        let mut cursor = col.find(doc! {}, opts).await?;
+        let mut results = Vec::new();
+        while cursor.advance().await? {
+            results.push(cursor.deserialize_current()?);
+        }
+        Ok(results)
+    }
+
+    /// Fetch a single history version, decrypt its secret fields using
+    /// `master_key`, and return the reconstituted `AdminSettings`.
+    pub async fn restore_config_history_entry(
+        &self,
+        collection_name: &str,
+        version: i64,
+        master_key: &str,
+    ) -> Result<crate::config::AdminSettings, AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>(collection_name);
+
+        let document = col
+            .find_one(doc! { "version": version }, None)
+            .await?
+            .ok_or_else(|| {
+                AppError::Validation(format!("config history version {version} not found"))
+            })?;
+
+        let mut settings_doc = document
+            .get_document("settings")
+            .map_err(|e| AppError::Validation(format!("missing settings in history doc: {e}")))?
+            .clone();
+
+        // Decrypt each secret field that was stored as an EncryptedSecret.
+        use crate::config_history::{decrypt_secret, EncryptedSecret};
+        for field in crate::config_history::SECRET_FIELDS {
+            if let Ok(inner) = settings_doc.get_document(field) {
+                // Only attempt decrypt if encrypted == true
+                if inner.get_bool("encrypted").unwrap_or(false) {
+                    let envelope: EncryptedSecret =
+                        bson::from_document(inner.clone()).map_err(|e| {
+                            AppError::Validation(format!(
+                                "failed to deserialize EncryptedSecret for {field}: {e}"
+                            ))
+                        })?;
+                    let plaintext = decrypt_secret(&envelope, master_key)?;
+                    settings_doc.insert(*field, plaintext);
+                }
+            }
+        }
+
+        let settings: crate::config::AdminSettings =
+            bson::from_document(settings_doc).map_err(|e| {
+                AppError::Validation(format!(
+                    "failed to deserialize restored admin settings: {e}"
+                ))
+            })?;
+
+        Ok(settings)
     }
 
     /// Fetch paginated records from `loggingtracker.logging_tracks`.
