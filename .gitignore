@@ -13,6 +13,10 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Runtime logs and local scratch artifacts
+logs/
+.scratch/
+
 # Local environment files
 .env
 .env.*
