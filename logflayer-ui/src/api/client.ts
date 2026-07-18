@@ -2,7 +2,8 @@ import axios, { type AxiosInstance } from 'axios'
 import type {
   Target, SampleRecord, TrackingRecord, HealthResponse,
   PagedResponse, TargetsResponse, ClassificationRecord,
-  AdminSettings, SettingsResponse,
+  AdminSettings, SettingsResponse, HistoryEntry,
+  SampleMetadata, DeletionRecord,
 } from '../types'
 
 class LogflayerClient {
@@ -70,6 +71,20 @@ class LogflayerClient {
     return data
   }
 
+  async deleteSample(hash: string, targetId: string, reason: string): Promise<void> {
+    await this.http.delete(`/api/v1/samples/${hash}`, {
+      data: { target_id: targetId, reason },
+    })
+  }
+
+  // ── Deletions audit log ───────────────────────────────────────────────────
+  async getDeletions(params: {
+    limit?: number; page?: number
+  }): Promise<PagedResponse<DeletionRecord>> {
+    const { data } = await this.http.get('/api/v1/sample-deletions', { params })
+    return data
+  }
+
   // ── Classifications ───────────────────────────────────────────────────────
   async getClassifications(params: {
     target_id?: string; limit?: number; page?: number
@@ -87,6 +102,68 @@ class LogflayerClient {
   async saveAdminSettings(settings: AdminSettings): Promise<{ saved: boolean; restart_required: boolean }> {
     const { data } = await this.http.put('/api/v1/admin/settings', settings)
     return data
+  }
+
+  async getSettingsHistory(): Promise<{ entries: HistoryEntry[] }> {
+    const { data } = await this.http.get('/api/v1/admin/settings/history')
+    return data
+  }
+
+  async restoreSettingsVersion(version: number): Promise<{ restored: boolean; version: number }> {
+    const { data } = await this.http.post(`/api/v1/admin/settings/restore/${version}`)
+    return data
+  }
+
+  async restartService(): Promise<{ accepted: boolean; message: string }> {
+    const { data } = await this.http.post('/api/v1/admin/restart')
+    return data
+  }
+
+  // ── UpsideGate metadata ───────────────────────────────────────────────────
+  async getMetadata(params: {
+    target_id?: string; limit?: number; page?: number;
+    entity_type?: string; worth_classifying?: boolean
+  }): Promise<PagedResponse<SampleMetadata>> {
+    const { data } = await this.http.get('/api/v1/metadata', { params })
+    return data
+  }
+
+  async getMetadataByHash(sampleHash: string): Promise<{ metadata: SampleMetadata }> {
+    const { data } = await this.http.get(`/api/v1/metadata/${sampleHash}`)
+    return data
+  }
+
+  // ── UpsideGate output reads (Phase 6) ─────────────────────────────────────
+  // Backed by the dedicated graph + vector collections written by the
+  // pipeline's async output adapters.  The store may opt in to these when
+  // GRAPH_WRITER_ENABLED=true; otherwise it falls back to client-side
+  // synthesis from `metadata.entities` + `metadata.relations`.
+  async getRelations(params: {
+    sample_hash?: string; relation_type?: string;
+    limit?: number; page?: number
+  }): Promise<PagedResponse<unknown>> {
+    const { data } = await this.http.get('/api/v1/relations', { params })
+    return data
+  }
+
+  async getProvTriples(params: {
+    sample_hash?: string; subject?: string; predicate?: string;
+    limit?: number; page?: number
+  }): Promise<PagedResponse<unknown>> {
+    const { data } = await this.http.get('/api/v1/prov', { params })
+    return data
+  }
+
+  async getOtelSpans(params: {
+    sample_hash?: string; trace_id?: string;
+    limit?: number; page?: number
+  }): Promise<PagedResponse<unknown>> {
+    const { data } = await this.http.get('/api/v1/spans', { params })
+    return data
+  }
+
+  async confirmSettings(): Promise<void> {
+    await this.http.post('/api/v1/admin/confirm')
   }
 
   async fetchModels(

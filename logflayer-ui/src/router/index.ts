@@ -45,6 +45,31 @@ const router = createRouter({
       component: () => import('../views/AdminView.vue'),
       meta: { title: 'Admin Settings' },
     },
+    // ── UpsideGate views ──────────────────────────────────────────────────────
+    {
+      path: '/upsidegate/entities',
+      name: 'ug-entities',
+      component: () => import('../views/upsidegate/EntitiesView.vue'),
+      meta: { title: 'Entity Browser' },
+    },
+    {
+      path: '/upsidegate/relations',
+      name: 'ug-relations',
+      component: () => import('../views/upsidegate/RelationsView.vue'),
+      meta: { title: 'Relation Graph' },
+    },
+    {
+      path: '/upsidegate/prov',
+      name: 'ug-prov',
+      component: () => import('../views/upsidegate/ProvView.vue'),
+      meta: { title: 'PROV-O Triples' },
+    },
+    {
+      path: '/upsidegate/spans',
+      name: 'ug-spans',
+      component: () => import('../views/upsidegate/SpansView.vue'),
+      meta: { title: 'OTel Spans' },
+    },
   ],
 })
 

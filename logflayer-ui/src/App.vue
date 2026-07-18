@@ -18,18 +18,40 @@
         </div>
 
         <!-- Navigation -->
-        <ul class="space-y-1 font-medium flex-1">
-          <li v-for="link in navLinks" :key="link.to">
-            <router-link
-              :to="link.to"
-              class="flex items-center gap-3 p-2 rounded-lg hover:bg-[#dc143c]/10 text-[rgba(245,245,220,0.70)] hover:text-[#f5f5dc] transition-all duration-200"
-              active-class="bg-[#dc143c]/20 text-[#f5f5dc] border-l-2 border-[#dc143c] shadow-[0_0_8px_rgba(220,20,60,0.2)]"
-            >
-              <span class="text-lg">{{ link.icon }}</span>
-              <span>{{ link.label }}</span>
-            </router-link>
-          </li>
-        </ul>
+        <div class="flex-1 space-y-4">
+          <!-- Logflayer section -->
+          <ul class="space-y-1 font-medium">
+            <li v-for="link in navLinks" :key="link.to">
+              <router-link
+                :to="link.to"
+                class="flex items-center gap-3 p-2 rounded-lg hover:bg-[#dc143c]/10 text-[rgba(245,245,220,0.70)] hover:text-[#f5f5dc] transition-all duration-200"
+                active-class="bg-[#dc143c]/20 text-[#f5f5dc] border-l-2 border-[#dc143c] shadow-[0_0_8px_rgba(220,20,60,0.2)]"
+              >
+                <span class="text-lg">{{ link.icon }}</span>
+                <span>{{ link.label }}</span>
+              </router-link>
+            </li>
+          </ul>
+
+          <!-- UpsideGate section -->
+          <div>
+            <div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-widest text-[rgba(245,245,220,0.25)]">
+              UpsideGate ETL
+            </div>
+            <ul class="space-y-1 font-medium mt-1">
+              <li v-for="link in ugNavLinks" :key="link.to">
+                <router-link
+                  :to="link.to"
+                  class="flex items-center gap-3 p-2 rounded-lg hover:bg-[#00d4ff]/10 text-[rgba(245,245,220,0.60)] hover:text-[#f5f5dc] transition-all duration-200"
+                  active-class="bg-[#00d4ff]/15 text-[#f5f5dc] border-l-2 border-[#00d4ff] shadow-[0_0_8px_rgba(0,212,255,0.1)]"
+                >
+                  <span class="text-lg">{{ link.icon }}</span>
+                  <span>{{ link.label }}</span>
+                </router-link>
+              </li>
+            </ul>
+          </div>
+        </div>
 
         <!-- Stats footer -->
         <div class="mt-auto px-2 pt-4 border-t border-[#dc143c]/20 text-xs text-[rgba(245,245,220,0.40)] space-y-1">
@@ -73,6 +95,13 @@ const navLinks = [
   { to: '/samples',         icon: '🗄️',  label: 'Samples'        },
   { to: '/classifications', icon: '🧠', label: 'Classifications' },
   { to: '/admin',           icon: '⚙️', label: 'Admin Settings'  },
+]
+
+const ugNavLinks = [
+  { to: '/upsidegate/entities',  icon: '🔬', label: 'Entity Browser' },
+  { to: '/upsidegate/relations', icon: '🔗', label: 'Relation Graph' },
+  { to: '/upsidegate/prov',      icon: '📐', label: 'PROV-O Triples' },
+  { to: '/upsidegate/spans',     icon: '📡', label: 'OTel Spans'     },
 ]
 
 onMounted(async () => {
