@@ -446,6 +446,162 @@ impl ClassificationStatus {
     }
 }
 
+// ─── UpsideGate entity model ──────────────────────────────────────────────────
+
+/// Typed category for a parsed log event entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityType {
+    PromptEvent,
+    CompletionEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+    RetrievalEvent,
+    AgentStep,
+    McpEvent,
+    ContextWindow,
+    #[default]
+    Unknown,
+}
+
+/// Semantic role of an entity within an AI execution — replaces traditional
+/// log severity (info / warning / error) for AI-native logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRole {
+    SystemPrompt,
+    UserTurn,
+    AssistantTurn,
+    ToolInvocation,
+    ToolResponse,
+    RetrievalQuery,
+    RetrievalResult,
+    AgentReasoning,
+    AgentAction,
+    AgentObservation,
+    McpRequest,
+    McpResponse,
+    ContextAssembly,
+    MemoryRead,
+    MemoryWrite,
+    #[default]
+    Unknown,
+}
+
+/// How a [`RelationEdge`] was established.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationSource {
+    /// Derived from an explicit field in the log (e.g. a matching `tool_call_id`).
+    Explicit,
+    /// Derived from structural position and type-pair rules.
+    #[default]
+    Inferred,
+    /// Directly stated in a structured metadata field.
+    Parsed,
+}
+
+/// Directed relationship type between two [`EntityRecord`] instances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RelationType {
+    /// A prompt or agent step caused a tool call or downstream event.
+    TriggeredBy,
+    /// An activity produced this entity (LLM → completion, tool call → result).
+    Generated,
+    /// A retrieval result informed the construction of a prompt.
+    Informed,
+    /// Temporal successor in the same agent run.
+    FollowedBy,
+    /// A completion directly responded to a prompt.
+    RespondedTo,
+    /// A context window was assembled from this entity.
+    AssembledFrom,
+    /// Entity belongs to a containing trace / session / run.
+    PartOf,
+    /// An agent step delegated work to an MCP server.
+    DelegatedTo,
+}
+
+/// A single parsed log event, typed and enriched by UpsideGate stages 6–7.
+///
+/// Stored inside [`SampleMetadata::entities`]; also written to the
+/// `entity_nodes` collection when the graph writer is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityRecord {
+    /// Stable content-derived identifier (32-hex-char SHA-256 of
+    /// `(sample_hash, "entity", line_index, raw_text)`, see
+    /// [`crate::preprocessing::ids::derive_entity_id`]).  Same content ⇒
+    /// same id, so the graph writer's upsert filters actually match on
+    /// re-runs instead of inserting duplicates.
+    pub entity_id: String,
+    pub entity_type: EntityType,
+    pub semantic_role: SemanticRole,
+    /// FK to the parent [`SampleRecord`] / [`SampleMetadata`].
+    pub sample_hash: String,
+    pub target_id: String,
+    /// W3C-OTel 16-byte hex trace id, derived from `sample_hash` so all
+    /// entities in a sample share the same trace and re-runs reuse it.
+    /// See [`crate::preprocessing::ids::derive_trace_id`].
+    pub trace_id: String,
+    /// W3C-OTel 8-byte hex span id, derived from `(sample_hash, line_index)`.
+    /// See [`crate::preprocessing::ids::derive_span_id`].
+    pub span_id: String,
+    /// Span id of the logical parent entity, if any.
+    pub parent_span_id: Option<String>,
+    /// W3C PROV entity URI: `ug:entity:{entity_id}`
+    pub prov_entity_id: String,
+    /// W3C PROV activity URI: `ug:activity:{sample_hash}:{line_index}`
+    pub prov_activity_id: String,
+    /// Zero-based line position within the sample content.
+    pub line_index: u32,
+    /// The original log line(s) that produced this entity.
+    pub raw_text: String,
+    /// Key/value fields extracted from the log line (JSON / Logfmt only).
+    pub extracted_fields: HashMap<String, serde_json::Value>,
+    /// LLM model identifier detected in the log (e.g. `"gpt-4o"`).
+    pub model_id: Option<String>,
+    /// Tool name for `ToolCallEvent` / `ToolResultEvent`.
+    pub tool_name: Option<String>,
+    /// MCP server identifier for `McpEvent`.
+    pub mcp_server_id: Option<String>,
+    /// Token count from `prompt_tokens` / `completion_tokens` fields.
+    pub token_count: Option<u32>,
+    /// Latency in milliseconds extracted from the log.
+    pub latency_ms: Option<u64>,
+    /// Timestamp parsed from the log line itself.
+    pub timestamp_utc: Option<DateTime>,
+    /// FK to the content embedding record — populated asynchronously by the
+    /// embedding worker (Phase 5).
+    pub content_embedding_id: Option<String>,
+    /// FK to the behavioral embedding record — populated asynchronously.
+    pub behavioral_embedding_id: Option<String>,
+}
+
+/// A directed relationship between two [`EntityRecord`] instances.
+///
+/// Stored inside [`SampleMetadata::relations`]; also written to the
+/// `entity_edges` collection when the graph writer is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationEdge {
+    /// Stable content-derived identifier (32-hex-char SHA-256 of
+    /// `(sample_hash, "rel", relation_type, source_entity_id, target_entity_id)`,
+    /// see [`crate::preprocessing::ids::derive_relation_id`]).  Re-running
+    /// the relation extractor produces the same id, making the graph
+    /// writer's upsert path idempotent.
+    pub relation_id: String,
+    pub relation_type: RelationType,
+    pub source_entity_id: String,
+    pub target_entity_id: String,
+    pub sample_hash: String,
+    /// `1.0` = explicit field match; `0.7` = positional inference; etc.
+    pub confidence: f32,
+    pub source: RelationSource,
+    pub created_at: DateTime,
+}
+
+// ─── SampleMetadata ───────────────────────────────────────────────────────────
+
 /// Full preprocessing result stored in the `sample_metadata` collection.
 ///
 /// Keyed by `sample_hash` — the same hash used in `SampleRecord` — so the two
@@ -465,6 +621,26 @@ pub struct SampleMetadata {
     pub schema: Option<LogSchema>,
     pub ingestion_hints: IngestionHints,
     pub classification_status: ClassificationStatus,
+    // ── UpsideGate fields (Phase 0+) ─────────────────────────────────────────
+    /// OTel-compatible 32-hex-char trace id generated at pipeline entry.
+    /// Links all entity records for this sample to a single trace.
+    /// Absent on v1 documents — use `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub otel_trace_id: String,
+    /// Typed entity records extracted from the log sample (Stage 6).
+    /// Populated by `preprocessing::entity_extractor`; may be empty when no
+    /// agentic patterns match the content.
+    #[serde(default)]
+    pub entities: Vec<EntityRecord>,
+    /// Directed relation edges between entities (Stage 8).
+    #[serde(default)]
+    pub relations: Vec<RelationEdge>,
+    /// Snapshot counts — redundant with `entities.len()` / `relations.len()`
+    /// but useful for MongoDB aggregation queries without array unwinding.
+    #[serde(default)]
+    pub entity_count: u32,
+    #[serde(default)]
+    pub relation_count: u32,
 }
 
 impl SampleMetadata {
