@@ -1,0 +1,19 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{"sampling":{},"experimental":{}},"clientInfo":{"name":"claude-code","version":"1.5.0"}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":true},"prompts":{"listChanged":true},"logging":{}},"serverInfo":{"name":"acme-mcp-server","version":"2.1.3"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"web_search","description":"Search the web for relevant pages","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"calculator","description":"Evaluate an arithmetic expression","inputSchema":{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}},{"name":"read_file","description":"Read the contents of a file"}]}}
+{"jsonrpc":"2.0","id":3,"method":"prompts/list","params":{}}
+{"jsonrpc":"2.0","id":3,"result":{"prompts":[{"name":"summarise","description":"Summarise a passage of text","arguments":[{"name":"text","required":true}]}]}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"acme corp annual report 2025"}}}
+{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"req-4","progress":0.4,"total":1.0}}
+{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"Found 3 relevant pages: 1) acme.com/investors, 2) reuters.com/acme-q4, 3) sec.gov/acme-10k"}],"isError":false}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"calculator","arguments":{"expression":"sqrt(-1)"}}}
+{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Invalid arguments: cannot evaluate sqrt of negative number"}}
+{"jsonrpc":"2.0","id":6,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"What is the capital of France?"}}],"maxTokens":256,"modelPreferences":{"hints":[{"name":"claude-sonnet"}]}}}
+{"jsonrpc":"2.0","id":6,"result":{"role":"assistant","content":{"type":"text","text":"Paris is the capital of France."},"model":"claude-sonnet-4-6","stopReason":"endTurn"}}
+{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"file:///proc/uptime"}}
+{"jsonrpc":"2.0","id":7,"result":{"contents":[{"uri":"file:///proc/uptime","mimeType":"text/plain","text":"123456.78 99999.99\n"}]}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/hostname"}}}
+{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"acme-host-01"}],"isError":false}}
+{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"acme-mcp-server","data":"session ending normally"}}
