@@ -94,6 +94,7 @@ const navLinks = [
   { to: '/tracking',        icon: '🔍', label: 'Logging Tracker' },
   { to: '/samples',         icon: '🗄️',  label: 'Samples'        },
   { to: '/classifications', icon: '🧠', label: 'Classifications' },
+  { to: '/deletions',       icon: '🗑️', label: 'Deletions'       },
   { to: '/admin',           icon: '⚙️', label: 'Admin Settings'  },
 ]
 

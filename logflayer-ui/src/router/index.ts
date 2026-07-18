@@ -40,6 +40,12 @@ const router = createRouter({
       meta: { title: 'Classifications' },
     },
     {
+      path: '/deletions',
+      name: 'deletions',
+      component: () => import('../views/DeletionsView.vue'),
+      meta: { title: 'Sample Deletions' },
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('../views/AdminView.vue'),
