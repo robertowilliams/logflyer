@@ -102,7 +102,13 @@ pub async fn run(config: AppConfig, opts: BackfillOptions) -> Result<BackfillSum
                     let pipeline_start = Instant::now();
 
                     let metadata = match tokio::task::spawn_blocking(move || {
-                        prep.run(&hash, &target, &content)
+                        // Backfill only re-creates `SampleMetadata` documents.
+                        // Output adapters (graph + vector writers) are wired
+                        // into the live sampling path, not the backfill path —
+                        // re-running graph/vector writes here would risk
+                        // duplicating work and is not needed to recover from
+                        // a missing `sample_metadata` document.
+                        prep.run(&hash, &target, &content).metadata
                     })
                     .await
                     {
@@ -141,6 +147,10 @@ pub async fn run(config: AppConfig, opts: BackfillOptions) -> Result<BackfillSum
                         Ok(()) => {
                             counters.written.fetch_add(1, Ordering::Relaxed);
                             metrics::record_processed(worth);
+                            metrics::record_format_detected(metadata.format.log_type.as_str());
+                            if metadata.schema.is_some() {
+                                metrics::record_schema_extracted();
+                            }
                             if worth {
                                 counters.agentic.fetch_add(1, Ordering::Relaxed);
                             }

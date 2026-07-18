@@ -1,12 +1,15 @@
 pub mod api;
 pub mod backfill;
 pub mod classification;
-pub mod notification;
 pub mod config;
+pub mod config_history;
+pub mod embedding;
 pub mod error;
 pub mod logging;
 pub mod metrics;
 pub mod models;
+pub mod notification;
+pub mod output;
 pub mod preprocessing;
 pub mod repository;
 pub mod sampling;
