@@ -19,6 +19,8 @@ pub enum AppError {
     Join(String),
     #[error("classification error: {0}")]
     Classification(String),
+    #[error("embedding error: {0}")]
+    Embedding(String),
     #[error("http error: {0}")]
     Http(String),
     #[error("json error: {0}")]
