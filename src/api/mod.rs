@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -13,8 +14,13 @@ use crate::repository::MongoRepository;
 
 pub mod admin;
 pub mod classifications;
+pub mod deletions;
 pub mod logs;
+pub mod metadata;
+pub mod prov;
+pub mod relations;
 pub mod samples;
+pub mod spans;
 pub mod targets;
 pub mod tracking;
 
@@ -26,6 +32,9 @@ pub struct ApiState {
     pub config: AppConfig,
     /// Poke this to trigger an immediate sampling cycle from the service loop.
     pub sample_trigger: Arc<Notify>,
+    /// True when this process started with an unconfirmed pending config.
+    /// Reset to false once the frontend calls POST /api/v1/admin/confirm.
+    pub pending_confirmation: Arc<AtomicBool>,
 }
 
 pub type SharedState = Arc<ApiState>;
@@ -46,11 +55,23 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/tracking", get(tracking::list))
         .route("/api/v1/samples", get(samples::list))
         .route("/api/v1/samples/collections", get(samples::collections))
+        .route("/api/v1/samples/:hash", delete(samples::delete_one))
         .route("/api/v1/sample", post(trigger_sample_handler))
+        .route("/api/v1/metadata", get(metadata::list))
+        .route("/api/v1/metadata/:hash", get(metadata::get_one))
+        .route("/api/v1/sample-deletions", get(deletions::list))
         .route("/api/v1/classifications", get(classifications::list))
         .route("/api/v1/classifications/:hash", get(classifications::get_one))
-        .route("/api/v1/admin/settings", get(admin::get_settings).put(admin::put_settings))
-        .route("/api/v1/admin/models",   get(admin::get_models))
+        // ── UpsideGate output reads (Phase 6) ─────────────────────────────────
+        .route("/api/v1/relations", get(relations::list))
+        .route("/api/v1/prov",      get(prov::list))
+        .route("/api/v1/spans",     get(spans::list))
+        .route("/api/v1/admin/settings",                  get(admin::get_settings).put(admin::put_settings))
+        .route("/api/v1/admin/settings/history",          get(admin::get_settings_history))
+        .route("/api/v1/admin/settings/restore/:version", post(admin::post_settings_restore))
+        .route("/api/v1/admin/confirm",                   post(admin::confirm_settings))
+        .route("/api/v1/admin/models",                    get(admin::get_models))
+        .route("/api/v1/admin/restart",                   post(admin::restart))
         .layer(CorsLayer::permissive())
         .with_state(shared)
 }

@@ -1,4 +1,4 @@
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -37,6 +37,37 @@ pub async fn list(
             "page": page + 1,
             "limit": q.limit,
         }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DeleteBody {
+    target_id: String,
+    reason: String,
+}
+
+/// `DELETE /api/v1/samples/:hash` — remove a sample and log the reason.
+pub async fn delete_one(
+    State(s): State<SharedState>,
+    Path(hash): Path<String>,
+    Json(body): Json<DeleteBody>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    if body.reason.trim().is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "reason is required" })),
+        ));
+    }
+    match s
+        .repo
+        .delete_sample(&body.target_id, &hash, body.reason.trim())
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
