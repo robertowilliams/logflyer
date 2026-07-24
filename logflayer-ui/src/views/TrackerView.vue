@@ -50,7 +50,7 @@
     <div v-if="selected !== null && store.trackingRecords[selected]" class="card bg-[#0a0a0a] border-[#dc143c]/30">
       <div class="flex justify-between items-center mb-3">
         <span class="text-[rgba(245,245,220,0.80)] font-semibold text-sm">Record Detail</span>
-        <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors">✕</button>
+        <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors"><X :size="16" /></button>
       </div>
       <pre class="text-xs text-[#00d4ff] overflow-x-auto">{{ JSON.stringify(store.trackingRecords[selected], null, 2) }}</pre>
     </div>
@@ -59,9 +59,9 @@
     <div class="flex items-center justify-between text-sm text-[rgba(245,245,220,0.40)]">
       <span>{{ store.trackingTotal }} total records</span>
       <div class="flex gap-2">
-        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40">← Prev</button>
+        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1"><ChevronLeft :size="14" />Prev</button>
         <span class="px-3 py-1">Page {{ page }}</span>
-        <button :disabled="page * limit >= store.trackingTotal" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40">Next →</button>
+        <button :disabled="page * limit >= store.trackingTotal" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1">Next<ChevronRight :size="14" /></button>
       </div>
     </div>
   </div>
@@ -69,6 +69,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { ChevronLeft, ChevronRight, X } from 'lucide-vue-next'
 import { useLogflayerStore } from '../stores/logflayer'
 
 const store = useLogflayerStore()

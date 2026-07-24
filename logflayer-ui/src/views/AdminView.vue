@@ -4,22 +4,22 @@
     <!-- Restart banner -->
     <div v-if="restartRequired && !restarting"
       class="flex items-center gap-3 px-4 py-3 rounded-lg border border-[#f59e0b]/40 bg-[#f59e0b]/10 text-[#f59e0b] text-sm">
-      <span class="text-lg">⚠️</span>
+      <AlertTriangle :size="18" class="shrink-0" />
       <span>Settings saved — restart the container to apply changes.</span>
       <button @click="triggerRestart"
         class="ml-auto px-3 py-1 rounded border border-[#f59e0b]/50 hover:border-[#f59e0b]
-               text-xs font-medium transition-colors whitespace-nowrap">
-        🔄 Restart now
+               text-xs font-medium transition-colors whitespace-nowrap inline-flex items-center gap-1.5">
+        <RotateCw :size="13" />Restart now
       </button>
-      <button @click="restartRequired = false" class="opacity-60 hover:opacity-100">✕</button>
+      <button @click="restartRequired = false" class="opacity-60 hover:opacity-100"><X :size="16" /></button>
     </div>
 
     <!-- Error banner -->
     <div v-if="errorMsg"
       class="flex items-center gap-3 px-4 py-3 rounded-lg border border-[#dc143c]/40 bg-[#dc143c]/10 text-[#dc143c] text-sm">
-      <span class="text-lg">✕</span>
+      <AlertCircle :size="18" class="shrink-0" />
       <span>{{ errorMsg }}</span>
-      <button @click="errorMsg = ''" class="ml-auto opacity-60 hover:opacity-100">✕</button>
+      <button @click="errorMsg = ''" class="ml-auto opacity-60 hover:opacity-100"><X :size="16" /></button>
     </div>
 
     <!-- Loading state -->
@@ -30,9 +30,10 @@
     <template v-else>
       <!-- ── MongoDB ───────────────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">🗄️ MongoDB</h2>
-        <p class="text-xs text-[rgba(245,245,220,0.40)] mb-4">
-          ⚠️ Changes here take effect on the next container restart. If the URI is wrong the service will fall back to the env-var value on startup.
+        <h2 class="section-title flex items-center gap-1.5"><Database :size="14" />MongoDB</h2>
+        <p class="text-xs text-[rgba(245,245,220,0.40)] mb-4 flex items-start gap-1.5">
+          <AlertTriangle :size="13" class="shrink-0 mt-0.5" />
+          <span>Changes here take effect on the next container restart. If the URI is wrong the service will fall back to the env-var value on startup.</span>
         </p>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field md:col-span-2">
@@ -75,7 +76,7 @@
 
       <!-- ── Sampling ─────────────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">🔁 Sampling</h2>
+        <h2 class="section-title flex items-center gap-1.5"><Repeat :size="14" />Sampling</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field">
             <label>Sample mode</label>
@@ -94,7 +95,7 @@
 
       <!-- ── Service ────────────────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">⚙️ Service</h2>
+        <h2 class="section-title flex items-center gap-1.5"><Settings :size="14" />Service</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field">
             <label>Run mode</label>
@@ -124,7 +125,7 @@
 
       <!-- ── Remote discovery ───────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">🔍 Remote File Discovery</h2>
+        <h2 class="section-title flex items-center gap-1.5"><Search :size="14" />Remote File Discovery</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field">
             <label>Max directory depth <span class="hint">(REMOTE_MAX_DEPTH)</span></label>
@@ -144,7 +145,7 @@
 
       <!-- ── Preprocessing ─────────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">🧹 Preprocessing Pipeline</h2>
+        <h2 class="section-title flex items-center gap-1.5"><SlidersHorizontal :size="14" />Preprocessing Pipeline</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field md:col-span-2">
             <toggle-field v-model="form.preprocessing_enabled" label="Enable preprocessing" />
@@ -168,7 +169,7 @@
 
       <!-- ── LLM Classification ─────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">🧠 LLM Classification</h2>
+        <h2 class="section-title flex items-center gap-1.5"><Brain :size="14" />LLM Classification</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field md:col-span-2">
             <toggle-field v-model="form.classification_enabled" label="Enable LLM classification" />
@@ -213,18 +214,18 @@
                   Fetching models…
                 </span>
                 <button v-else-if="canFetchModels" @click="fetchModels"
-                  class="text-[#00d4ff] hover:underline">
-                  🔄 Fetch models
+                  class="text-[#00d4ff] hover:underline inline-flex items-center gap-1.5">
+                  <RotateCw :size="13" />Fetch models
                 </button>
                 <button v-if="availableModels.length > 0 && !modelManualMode"
                   @click="modelManualMode = true"
-                  class="text-[rgba(245,245,220,0.35)] hover:text-[rgba(245,245,220,0.70)]">
-                  ✏️ type manually
+                  class="text-[rgba(245,245,220,0.35)] hover:text-[rgba(245,245,220,0.70)] inline-flex items-center gap-1.5">
+                  <Pencil :size="13" />type manually
                 </button>
                 <button v-if="modelManualMode && availableModels.length > 0"
                   @click="modelManualMode = false"
-                  class="text-[rgba(245,245,220,0.35)] hover:text-[rgba(245,245,220,0.70)]">
-                  📋 show list
+                  class="text-[rgba(245,245,220,0.35)] hover:text-[rgba(245,245,220,0.70)] inline-flex items-center gap-1.5">
+                  <List :size="13" />show list
                 </button>
               </div>
             </div>
@@ -267,7 +268,7 @@
 
       <!-- ── Notifications ─────────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">🔔 Notifications</h2>
+        <h2 class="section-title flex items-center gap-1.5"><Bell :size="14" />Notifications</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field md:col-span-2">
             <toggle-field v-model="form.notification_enabled" label="Enable notifications" />
@@ -306,7 +307,7 @@
 
       <!-- ── Logging ───────────────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">📋 Logging</h2>
+        <h2 class="section-title flex items-center gap-1.5"><ScrollText :size="14" />Logging</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div class="field">
             <label>Log level</label>
@@ -341,7 +342,7 @@
 
       <!-- ── Config history ────────────────────────────────────────────────── -->
       <section class="card">
-        <h2 class="section-title">🔐 Configuration History</h2>
+        <h2 class="section-title flex items-center gap-1.5"><Lock :size="14" />Configuration History</h2>
         <p class="text-xs text-[rgba(245,245,220,0.40)] mb-4">
           When enabled, every settings save creates an encrypted snapshot in MongoDB.
           Secret fields are AES-256-GCM encrypted using the master key — store the key safely outside the database.
@@ -382,16 +383,16 @@
         <div class="flex items-center gap-2">
           <button @click="save" :disabled="saving || restarting"
             class="btn-primary flex items-center gap-2 disabled:opacity-50">
-            <span v-if="saving">⏳ Saving…</span>
-            <span v-else>💾 Save settings</span>
+            <span v-if="saving" class="inline-flex items-center gap-1.5"><Loader2 :size="14" class="animate-spin" />Saving…</span>
+            <span v-else class="inline-flex items-center gap-1.5"><Save :size="14" />Save settings</span>
           </button>
           <button @click="triggerRestart" :disabled="saving || restarting"
             class="flex items-center gap-2 px-4 py-2 rounded text-sm font-medium transition-colors
                    border border-[rgba(245,245,220,0.20)] text-[rgba(245,245,220,0.70)]
                    hover:border-[rgba(245,245,220,0.40)] hover:text-[rgba(245,245,220,0.90)]
                    disabled:opacity-40">
-            <span v-if="restarting">⏳ Restarting…</span>
-            <span v-else>🔄 Save &amp; Restart</span>
+            <span v-if="restarting" class="inline-flex items-center gap-1.5"><Loader2 :size="14" class="animate-spin" />Restarting…</span>
+            <span v-else class="inline-flex items-center gap-1.5"><RotateCw :size="14" />Save &amp; Restart</span>
           </button>
         </div>
       </div>
@@ -410,12 +411,13 @@
       <!-- ── Configuration history ─────────────────────────────────────────── -->
       <section v-if="historyEntries.length > 0 || historyLoading" class="card">
         <div class="flex items-center justify-between mb-4">
-          <h2 class="section-title mb-0">🕑 Configuration History</h2>
+          <h2 class="section-title mb-0 flex items-center gap-1.5"><History :size="14" />Configuration History</h2>
           <button @click="loadHistory" :disabled="historyLoading"
             class="text-xs px-2 py-1 rounded border border-[rgba(245,245,220,0.15)]
                    text-[rgba(245,245,220,0.50)] hover:text-[rgba(245,245,220,0.80)]
                    hover:border-[rgba(245,245,220,0.30)] disabled:opacity-40 transition-colors">
-            {{ historyLoading ? '⏳ Loading…' : '↻ Refresh' }}
+            <span v-if="historyLoading" class="inline-flex items-center gap-1.5"><Loader2 :size="12" class="animate-spin" />Loading…</span>
+            <span v-else class="inline-flex items-center gap-1.5"><RefreshCw :size="12" />Refresh</span>
           </button>
         </div>
 
@@ -468,7 +470,7 @@
             ? 'border border-green-700/40 bg-green-900/10 text-green-400'
             : 'border border-[#dc143c]/40 bg-[#dc143c]/10 text-[#dc143c]'">
           {{ restoreMsg }}
-          <button @click="restoreMsg = ''" class="ml-auto opacity-60 hover:opacity-100">✕</button>
+          <button @click="restoreMsg = ''" class="ml-auto opacity-60 hover:opacity-100"><X :size="16" /></button>
         </div>
       </section>
 
@@ -478,6 +480,10 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import {
+  AlertTriangle, AlertCircle, RotateCw, RefreshCw, X, Database, Repeat, Settings,
+  Search, SlidersHorizontal, Brain, Bell, ScrollText, Lock, History, Pencil, List, Save, Loader2,
+} from 'lucide-vue-next'
 import { client } from '../api/client'
 import type { AdminSettings, HistoryEntry } from '../types'
 
@@ -718,7 +724,7 @@ async function restore(version: number) {
   try {
     await client.restoreSettingsVersion(version)
     restoreMsgOk.value = true
-    restoreMsg.value   = `✓ Restored to v${version}. Reload the page to see the restored values.`
+    restoreMsg.value   = `Restored to v${version}. Reload the page to see the restored values.`
     restartRequired.value = true
     loadHistory()
   } catch {

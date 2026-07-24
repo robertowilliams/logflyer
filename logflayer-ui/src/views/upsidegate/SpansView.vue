@@ -6,7 +6,7 @@
         <option value="">All targets</option>
         <option v-for="c in store.sampleCollections" :key="c" :value="c">{{ c }}</option>
       </select>
-      <button @click="loadPage(1)" class="btn-primary">↻ Refresh</button>
+      <button @click="loadPage(1)" class="btn-primary inline-flex items-center gap-1.5"><RefreshCw :size="14" />Refresh</button>
       <span class="ml-auto text-[rgba(245,245,220,0.40)] text-sm self-center">{{ ugStore.metadataTotal }} sample(s)</span>
     </div>
 
@@ -49,8 +49,8 @@
     <div class="flex items-center justify-between text-sm text-[rgba(245,245,220,0.40)]">
       <span>Page {{ page }}</span>
       <div class="flex gap-2">
-        <button :disabled="page <= 1" @click="loadPage(page - 1)" class="btn-secondary py-1 disabled:opacity-40">← Prev</button>
-        <button :disabled="page * limit >= ugStore.metadataTotal" @click="loadPage(page + 1)" class="btn-secondary py-1 disabled:opacity-40">Next →</button>
+        <button :disabled="page <= 1" @click="loadPage(page - 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1"><ChevronLeft :size="14" />Prev</button>
+        <button :disabled="page * limit >= ugStore.metadataTotal" @click="loadPage(page + 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1">Next<ChevronRight :size="14" /></button>
       </div>
     </div>
 
@@ -67,7 +67,7 @@
             <div class="text-xs text-[rgba(245,245,220,0.40)] mb-1">Spans (unique)</div>
             <div class="text-2xl font-bold text-[#f5f5dc]">{{ ugStore.otelSpans.length }}</div>
           </div>
-          <button @click="ugStore.selectMetadata(null)" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] text-xs self-start">✕ Clear</button>
+          <button @click="ugStore.selectMetadata(null)" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] text-xs self-start inline-flex items-center gap-1"><X :size="13" />Clear</button>
         </div>
       </div>
 
@@ -164,7 +164,7 @@
       <div v-if="selectedSpan" class="card bg-[#0a0a0a] border-[#00d4ff]/20 text-xs">
         <div class="flex justify-between items-center mb-3">
           <span class="text-[rgba(245,245,220,0.80)] font-semibold">Span Detail</span>
-          <button @click="selectedSpan = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc]">✕</button>
+          <button @click="selectedSpan = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc]"><X :size="14" /></button>
         </div>
         <div class="grid grid-cols-2 gap-x-8 gap-y-2 font-mono mb-4">
           <div><span class="text-[rgba(245,245,220,0.40)]">span_id</span><br><span class="text-[#00d4ff]">{{ selectedSpan.span_id }}</span></div>
@@ -194,6 +194,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useLogflayerStore } from '../../stores/logflayer'
 import { useUpsidegateStore } from '../../stores/upsidegate'
 import type { OtelSpan, SpanKind, SpanStatusCode } from '../../types'
+import { RefreshCw, ChevronLeft, ChevronRight, X } from 'lucide-vue-next'
 
 const store   = useLogflayerStore()
 const ugStore = useUpsidegateStore()

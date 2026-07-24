@@ -13,7 +13,7 @@
         <option value="info">Info</option>
         <option value="normal">Normal</option>
       </select>
-      <button @click="load(1)" class="btn-primary">↻ Refresh</button>
+      <button @click="load(1)" class="btn-primary inline-flex items-center gap-1.5"><RefreshCw :size="14" />Refresh</button>
       <span class="ml-auto text-[rgba(245,245,220,0.40)] text-sm self-center">{{ store.classificationsTotal }} total</span>
     </div>
 
@@ -75,7 +75,7 @@
           <span class="text-[rgba(245,245,220,0.80)] font-semibold text-sm">{{ filtered[selected!].target_id }}</span>
           <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ fmt(filtered[selected!].classified_at) }}</span>
         </div>
-        <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors flex-shrink-0 ml-4">✕</button>
+        <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors flex-shrink-0 ml-4"><X :size="16" /></button>
       </div>
 
       <!-- Summary -->
@@ -112,7 +112,7 @@
             :key="ri"
             class="text-sm text-[rgba(245,245,220,0.70)] flex items-start gap-2"
           >
-            <span class="text-[#00d4ff] mt-0.5 flex-shrink-0">→</span>{{ r }}
+            <ArrowRight :size="14" class="text-[#00d4ff] mt-0.5 flex-shrink-0" />{{ r }}
           </li>
         </ul>
       </div>
@@ -125,9 +125,9 @@
         <span>Confidence: <span class="text-[rgba(245,245,220,0.50)]">{{ (filtered[selected!].confidence * 100).toFixed(0) }}%</span></span>
         <router-link
           :to="`/samples?target_id=${filtered[selected!].target_id}`"
-          class="text-[#00d4ff] hover:underline ml-auto"
+          class="text-[#00d4ff] hover:underline ml-auto inline-flex items-center gap-1"
         >
-          View source sample →
+          View source sample<ArrowRight :size="14" />
         </router-link>
       </div>
     </div>
@@ -136,8 +136,8 @@
     <div class="flex items-center justify-between text-sm text-[rgba(245,245,220,0.40)]">
       <span>Page {{ page }}</span>
       <div class="flex gap-2">
-        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40">← Prev</button>
-        <button :disabled="page * limit >= store.classificationsTotal" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40">Next →</button>
+        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1"><ChevronLeft :size="14" />Prev</button>
+        <button :disabled="page * limit >= store.classificationsTotal" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1">Next<ChevronRight :size="14" /></button>
       </div>
     </div>
   </div>
@@ -145,6 +145,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { RefreshCw, ChevronLeft, ChevronRight, ArrowRight, X } from 'lucide-vue-next'
 import { useLogflayerStore } from '../stores/logflayer'
 
 const store = useLogflayerStore()

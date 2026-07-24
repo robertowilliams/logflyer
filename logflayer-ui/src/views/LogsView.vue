@@ -11,7 +11,7 @@
           <option :value="1000">1000</option>
         </select>
       </div>
-      <button @click="load" class="btn-primary py-1">↻ Refresh</button>
+      <button @click="load" class="btn-primary py-1 inline-flex items-center gap-1.5"><RefreshCw :size="14" />Refresh</button>
       <label class="flex items-center gap-2 text-[rgba(245,245,220,0.50)] text-sm cursor-pointer">
         <input type="checkbox" v-model="autoRefresh" class="rounded accent-[#dc143c]" />
         Auto-refresh (5s)
@@ -43,6 +43,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { RefreshCw } from 'lucide-vue-next'
 import { useLogflayerStore } from '../stores/logflayer'
 
 const store = useLogflayerStore()

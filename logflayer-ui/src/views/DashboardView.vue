@@ -15,8 +15,8 @@
         <div class="text-[rgba(245,245,220,0.50)] text-sm mt-1">Inactive</div>
       </div>
       <div class="card text-center">
-        <div class="text-3xl font-bold" :class="store.isHealthy ? 'text-green-400' : 'text-[#ff6b8a]'">
-          {{ store.isHealthy ? '●' : '●' }}
+        <div class="flex justify-center py-1.5" :class="store.isHealthy ? 'text-green-400' : 'text-[#ff6b8a]'">
+          <span class="inline-block w-4 h-4 rounded-full bg-current" />
         </div>
         <div class="text-[rgba(245,245,220,0.50)] text-sm mt-1">API {{ store.isHealthy ? 'Healthy' : 'Down' }}</div>
       </div>
@@ -26,7 +26,7 @@
     <div class="card">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-lg font-semibold text-[#f5f5dc]">Recent Targets</h2>
-        <router-link to="/targets" class="text-[#00d4ff] hover:text-[#00b8d9] text-sm transition-colors">View all →</router-link>
+        <router-link to="/targets" class="text-[#00d4ff] hover:text-[#00b8d9] text-sm transition-colors inline-flex items-center gap-1">View all<ArrowRight :size="14" /></router-link>
       </div>
       <div v-if="store.loading" class="text-[rgba(245,245,220,0.50)] text-sm">Loading...</div>
       <div v-else-if="store.targets.length === 0" class="text-[rgba(245,245,220,0.40)] text-sm">No targets configured yet.</div>
@@ -58,7 +58,7 @@
     <div v-if="store.classificationsTotal > 0 || store.classifications.length > 0" class="card">
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-lg font-semibold text-[#f5f5dc]">Classification Severity</h2>
-        <router-link to="/classifications" class="text-[#00d4ff] hover:text-[#00b8d9] text-sm transition-colors">View all →</router-link>
+        <router-link to="/classifications" class="text-[#00d4ff] hover:text-[#00b8d9] text-sm transition-colors inline-flex items-center gap-1">View all<ArrowRight :size="14" /></router-link>
       </div>
       <div class="flex flex-wrap gap-3">
         <div class="flex items-center gap-2 px-4 py-2 rounded-lg bg-[#dc143c]/10 border border-[#dc143c]/20">
@@ -84,7 +84,7 @@
     <div v-if="recentCriticals.length > 0" class="card">
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-lg font-semibold text-[#f5f5dc]">Recent Critical Findings</h2>
-        <router-link to="/classifications" class="text-[#00d4ff] hover:text-[#00b8d9] text-sm transition-colors">View all →</router-link>
+        <router-link to="/classifications" class="text-[#00d4ff] hover:text-[#00b8d9] text-sm transition-colors inline-flex items-center gap-1">View all<ArrowRight :size="14" /></router-link>
       </div>
       <div class="space-y-2">
         <div
@@ -106,22 +106,22 @@
     <!-- Quick links -->
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
       <router-link to="/logs" class="card hover:border-[#dc143c]/60 hover:shadow-[0_0_16px_rgba(220,20,60,0.15)] transition-all cursor-pointer block">
-        <div class="text-2xl mb-2">📋</div>
+        <div class="mb-2 text-[#00d4ff]"><ScrollText :size="24" /></div>
         <div class="font-semibold text-[#f5f5dc]">Live Logs</div>
         <div class="text-[rgba(245,245,220,0.50)] text-sm mt-1">View the logflayer service log in real time</div>
       </router-link>
       <router-link to="/tracking" class="card hover:border-[#dc143c]/60 hover:shadow-[0_0_16px_rgba(220,20,60,0.15)] transition-all cursor-pointer block">
-        <div class="text-2xl mb-2">🔍</div>
+        <div class="mb-2 text-[#00d4ff]"><Radar :size="24" /></div>
         <div class="font-semibold text-[#f5f5dc]">Logging Tracker</div>
         <div class="text-[rgba(245,245,220,0.50)] text-sm mt-1">Browse records in loggingtracker.logging_tracks</div>
       </router-link>
       <router-link to="/samples" class="card hover:border-[#dc143c]/60 hover:shadow-[0_0_16px_rgba(220,20,60,0.15)] transition-all cursor-pointer block">
-        <div class="text-2xl mb-2">🗄️</div>
+        <div class="mb-2 text-[#00d4ff]"><Database :size="24" /></div>
         <div class="font-semibold text-[#f5f5dc]">Samples</div>
         <div class="text-[rgba(245,245,220,0.50)] text-sm mt-1">Explore sampled log records from all targets</div>
       </router-link>
       <router-link to="/classifications" class="card hover:border-[#dc143c]/60 hover:shadow-[0_0_16px_rgba(220,20,60,0.15)] transition-all cursor-pointer block">
-        <div class="text-2xl mb-2">🧠</div>
+        <div class="mb-2 text-[#00d4ff]"><Brain :size="24" /></div>
         <div class="font-semibold text-[#f5f5dc]">Classifications</div>
         <div class="text-[rgba(245,245,220,0.50)] text-sm mt-1">LLM-classified log anomalies and insights</div>
       </router-link>
@@ -131,6 +131,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
+import { ScrollText, Radar, Database, Brain, ArrowRight } from 'lucide-vue-next'
 import { useLogflayerStore } from '../stores/logflayer'
 
 const store = useLogflayerStore()

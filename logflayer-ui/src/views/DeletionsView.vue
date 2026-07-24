@@ -2,7 +2,7 @@
   <div class="space-y-4">
     <!-- Header -->
     <div class="flex flex-wrap gap-3 items-center">
-      <button @click="load(1)" class="btn-primary">↻ Refresh</button>
+      <button @click="load(1)" class="btn-primary inline-flex items-center gap-1.5"><RefreshCw :size="14" />Refresh</button>
       <span class="ml-auto text-[rgba(245,245,220,0.40)] text-sm self-center">{{ total }} total deletions</span>
     </div>
 
@@ -42,8 +42,8 @@
     <div class="flex items-center justify-between text-sm text-[rgba(245,245,220,0.40)]">
       <span>Page {{ page }}</span>
       <div class="flex gap-2">
-        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40">← Prev</button>
-        <button :disabled="page * limit >= total" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40">Next →</button>
+        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1"><ChevronLeft :size="14" />Prev</button>
+        <button :disabled="page * limit >= total" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1">Next<ChevronRight :size="14" /></button>
       </div>
     </div>
   </div>
@@ -53,6 +53,7 @@
 import { ref, onMounted } from 'vue'
 import { client } from '../api/client'
 import type { DeletionRecord } from '../types'
+import { RefreshCw, ChevronLeft, ChevronRight } from 'lucide-vue-next'
 
 const records = ref<DeletionRecord[]>([])
 const total   = ref(0)

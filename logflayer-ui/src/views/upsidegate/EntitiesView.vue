@@ -12,7 +12,7 @@
         <option v-for="et in ENTITY_TYPES" :key="et" :value="et">{{ et }}</option>
       </select>
 
-      <button @click="loadPage(1)" class="btn-primary">↻ Refresh</button>
+      <button @click="loadPage(1)" class="btn-primary inline-flex items-center gap-1.5"><RefreshCw :size="14" />Refresh</button>
 
       <span class="ml-auto text-[rgba(245,245,220,0.40)] text-sm self-center">
         {{ ugStore.metadataTotal }} sample(s) ·
@@ -72,8 +72,8 @@
     <div class="flex items-center justify-between text-sm text-[rgba(245,245,220,0.40)]">
       <span>Page {{ page }}</span>
       <div class="flex gap-2">
-        <button :disabled="page <= 1" @click="loadPage(page - 1)" class="btn-secondary py-1 disabled:opacity-40">← Prev</button>
-        <button :disabled="page * limit >= ugStore.metadataTotal" @click="loadPage(page + 1)" class="btn-secondary py-1 disabled:opacity-40">Next →</button>
+        <button :disabled="page <= 1" @click="loadPage(page - 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1"><ChevronLeft :size="14" />Prev</button>
+        <button :disabled="page * limit >= ugStore.metadataTotal" @click="loadPage(page + 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1">Next<ChevronRight :size="14" /></button>
       </div>
     </div>
 
@@ -85,7 +85,7 @@
           <h2 class="text-sm font-semibold text-[#f5f5dc]">
             Entity breakdown — <span class="text-[#00d4ff] font-mono text-xs">{{ ugStore.selected.sample_hash.slice(0, 16) }}…</span>
           </h2>
-          <button @click="ugStore.selectMetadata(null)" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors text-xs">✕ Close</button>
+          <button @click="ugStore.selectMetadata(null)" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors text-xs inline-flex items-center gap-1"><X :size="13" />Close</button>
         </div>
         <div class="flex flex-wrap gap-2">
           <button
@@ -166,7 +166,7 @@
       <div v-if="selectedEntity" class="card bg-[#0a0a0a] border-[#00d4ff]/20 text-xs">
         <div class="flex justify-between items-center mb-3">
           <span class="text-[rgba(245,245,220,0.80)] font-semibold">Entity Detail</span>
-          <button @click="selectedEntity = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc]">✕</button>
+          <button @click="selectedEntity = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc]"><X :size="14" /></button>
         </div>
         <div class="grid grid-cols-2 gap-x-8 gap-y-2 font-mono">
           <div><span class="text-[rgba(245,245,220,0.40)]">entity_id</span><br><span class="text-[#00d4ff]">{{ selectedEntity.entity_id }}</span></div>
@@ -194,6 +194,7 @@ import { ref, onMounted } from 'vue'
 import { useLogflayerStore } from '../../stores/logflayer'
 import { useUpsidegateStore } from '../../stores/upsidegate'
 import type { EntityRecord, EntityType } from '../../types'
+import { RefreshCw, ChevronLeft, ChevronRight, X } from 'lucide-vue-next'
 
 const store   = useLogflayerStore()
 const ugStore = useUpsidegateStore()

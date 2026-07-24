@@ -6,7 +6,7 @@
         <option value="">All targets</option>
         <option v-for="c in store.sampleCollections" :key="c" :value="c">{{ c }}</option>
       </select>
-      <button @click="load(1)" class="btn-primary">↻ Refresh</button>
+      <button @click="load(1)" class="btn-primary inline-flex items-center gap-1.5"><RefreshCw :size="14" />Refresh</button>
       <span class="ml-auto text-[rgba(245,245,220,0.40)] text-sm self-center">{{ store.samplesTotal }} total records</span>
     </div>
 
@@ -50,9 +50,9 @@
             <td class="px-4 py-2 text-right" @click.stop>
               <button
                 @click="openDeleteDialog(s)"
-                class="text-[rgba(245,245,220,0.25)] hover:text-[#ff6b8a] transition-colors text-sm"
+                class="text-[rgba(245,245,220,0.25)] hover:text-[#ff6b8a] transition-colors inline-flex"
                 title="Delete sample"
-              >🗑</button>
+              ><Trash2 :size="15" /></button>
             </td>
           </tr>
         </tbody>
@@ -70,8 +70,8 @@
           <button
             @click="openDeleteDialog(store.samples[selected!])"
             class="text-[rgba(245,245,220,0.30)] hover:text-[#ff6b8a] transition-colors text-xs flex items-center gap-1"
-          >🗑 Delete</button>
-          <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors">✕</button>
+          ><Trash2 :size="13" />Delete</button>
+          <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors"><X :size="16" /></button>
         </div>
       </div>
       <pre v-if="store.samples[selected!].sample_content" class="text-xs text-[#00d4ff] overflow-auto whitespace-pre-wrap max-h-[500px]">{{ store.samples[selected!].sample_content }}</pre>
@@ -119,8 +119,8 @@
     <div class="flex items-center justify-between text-sm text-[rgba(245,245,220,0.40)]">
       <span>Page {{ page }}</span>
       <div class="flex gap-2">
-        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40">← Prev</button>
-        <button :disabled="page * limit >= store.samplesTotal" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40">Next →</button>
+        <button :disabled="page <= 1" @click="load(page - 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1"><ChevronLeft :size="14" />Prev</button>
+        <button :disabled="page * limit >= store.samplesTotal" @click="load(page + 1)" class="btn-secondary py-1 disabled:opacity-40 inline-flex items-center gap-1">Next<ChevronRight :size="14" /></button>
       </div>
     </div>
   </div>
@@ -128,6 +128,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { RefreshCw, ChevronLeft, ChevronRight, Trash2, X } from 'lucide-vue-next'
 import { useLogflayerStore } from '../stores/logflayer'
 import { client } from '../api/client'
 import type { SampleRecord } from '../types'
