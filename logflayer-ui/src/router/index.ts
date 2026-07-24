@@ -76,6 +76,13 @@ const router = createRouter({
       component: () => import('../views/upsidegate/SpansView.vue'),
       meta: { title: 'OTel Spans' },
     },
+    // Detached, chrome-less graph window (opened via the graph's detach button).
+    {
+      path: '/graph',
+      name: 'detached-graph',
+      component: () => import('../views/upsidegate/DetachedGraphView.vue'),
+      meta: { title: 'Relation Graph', bare: true },
+    },
   ],
 })
 

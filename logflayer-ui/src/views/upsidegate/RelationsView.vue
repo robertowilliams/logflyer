@@ -41,12 +41,12 @@
     <!-- Error banner -->
     <div v-if="ugStore.error" class="card border-[#dc143c]/60 bg-[#dc143c]/10 text-[#ff6b8a] text-sm flex items-center justify-between">
       <span>{{ ugStore.error }}</span>
-      <button @click="ugStore.clearError()" class="hover:text-[#f5f5dc]">✕</button>
+      <button @click="ugStore.clearError()" class="hover:text-[#f5f5dc]"><X :size="14" /></button>
     </div>
 
     <!-- No selection state -->
     <div v-if="!ugStore.selected && !ugStore.loading" class="card text-center py-12 text-[rgba(245,245,220,0.30)]">
-      <div class="text-4xl mb-3">🔗</div>
+      <div class="flex justify-center mb-3"><Share2 :size="36" class="text-[rgba(245,245,220,0.30)]" /></div>
       <div class="text-sm">Select a sample above to explore its relation graph.</div>
     </div>
 
@@ -72,7 +72,7 @@
               <option value="">All types</option>
               <option v-for="rt in RELATION_TYPES" :key="rt" :value="rt">{{ rt }}</option>
             </select>
-            <button @click="ugStore.selectMetadata(null); sampleHash = ''" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] text-xs">✕ Clear</button>
+            <button @click="ugStore.selectMetadata(null); sampleHash = ''" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] text-xs inline-flex items-center gap-1"><X :size="13" />Clear</button>
           </div>
         </div>
 
@@ -94,61 +94,55 @@
         </div>
       </div>
 
-      <!-- SVG mini-graph (entity nodes + arrows) -->
-      <div v-if="ugStore.filteredRelations.length > 0" class="card overflow-x-auto">
-        <div class="text-xs text-[rgba(245,245,220,0.40)] mb-3">Visual overview (simplified force layout)</div>
-        <svg
-          :width="Math.max(600, uniqueEntityIds.length * 120)"
-          height="200"
-          class="block"
-        >
-          <defs>
-            <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-              <path d="M0,0 L0,6 L6,3 z" fill="rgba(220,20,60,0.7)" />
-            </marker>
-          </defs>
-          <!-- Entity nodes -->
-          <g v-for="(eid, idx) in uniqueEntityIds" :key="eid">
-            <circle
-              :cx="nodeX(idx)"
-              cy="100"
-              r="24"
-              fill="#1a1a1a"
-              stroke="#dc143c"
-              stroke-opacity="0.4"
-              stroke-width="1"
-            />
-            <text
-              :x="nodeX(idx)"
-              y="104"
-              text-anchor="middle"
-              font-size="8"
-              fill="rgba(245,245,220,0.6)"
-              class="select-none"
-            >{{ eid.slice(0, 8) }}</text>
-          </g>
-          <!-- Relation edges -->
-          <g v-for="r in ugStore.filteredRelations" :key="r.relation_id">
-            <line
-              :x1="nodeX(uniqueEntityIds.indexOf(r.source_entity_id)) + 24"
-              y1="100"
-              :x2="Math.max(nodeX(uniqueEntityIds.indexOf(r.target_entity_id)) - 24, nodeX(uniqueEntityIds.indexOf(r.source_entity_id)) + 28)"
-              y2="100"
-              stroke="rgba(220,20,60,0.5)"
-              stroke-width="1.5"
-              marker-end="url(#arrow)"
-            />
-            <text
-              :x="(nodeX(uniqueEntityIds.indexOf(r.source_entity_id)) + nodeX(uniqueEntityIds.indexOf(r.target_entity_id))) / 2"
-              y="92"
-              text-anchor="middle"
-              font-size="7"
-              fill="rgba(0,212,255,0.7)"
-              class="select-none"
-            >{{ r.relation_type }}</text>
-          </g>
-        </svg>
+      <!-- Force-directed relation graph -->
+      <div v-if="ugStore.filteredRelations.length > 0" class="card">
+        <div class="text-xs text-[rgba(245,245,220,0.40)] mb-3 flex items-center justify-between">
+          <span>Drag · scroll to zoom · double-click node or edge for data · triple-click to pin</span>
+          <span>{{ uniqueEntityIds.length }} entities · {{ ugStore.filteredRelations.length }} relations</span>
+        </div>
+        <RelationGraph
+          :relations="ugStore.filteredRelations"
+          :entities="ugStore.entities"
+          @expand="showGraphModal = true"
+          @detach="openDetached"
+        />
       </div>
+
+      <!-- Expanded graph pop-up -->
+      <Teleport to="body">
+        <Transition name="rg-fade">
+          <div
+            v-if="showGraphModal"
+            class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-6"
+            @click.self="showGraphModal = false"
+          >
+            <div class="card bg-[#0f0f0f] border-[#dc143c]/30 w-full max-w-6xl h-[85vh] flex flex-col p-4">
+              <div class="flex items-center justify-between mb-3">
+                <div>
+                  <h2 class="text-sm font-semibold text-[#f5f5dc]">Relation Graph</h2>
+                  <div class="text-xs text-[rgba(245,245,220,0.40)] mt-0.5">
+                    {{ uniqueEntityIds.length }} entities · {{ ugStore.filteredRelations.length }} relations —
+                    scroll to zoom, drag nodes, drag canvas to pan, triple-click to pin
+                  </div>
+                </div>
+                <button
+                  @click="showGraphModal = false"
+                  class="text-[rgba(245,245,220,0.50)] hover:text-[#f5f5dc] inline-flex items-center gap-1 text-sm"
+                >
+                  <X :size="16" />Close
+                </button>
+              </div>
+              <div class="flex-1 min-h-0">
+                <RelationGraph
+                  :relations="ugStore.filteredRelations"
+                  :entities="ugStore.entities"
+                  expanded
+                />
+              </div>
+            </div>
+          </div>
+        </Transition>
+      </Teleport>
 
       <!-- Relations table -->
       <div class="card p-0 overflow-hidden">
@@ -162,7 +156,7 @@
           <thead class="bg-[#0f0f0f]">
             <tr class="text-[rgba(245,245,220,0.50)] text-left border-b border-[#dc143c]/20">
               <th class="px-3 py-2">Source Entity</th>
-              <th class="px-3 py-2 text-center">→ Type</th>
+              <th class="px-3 py-2 text-center"><span class="inline-flex items-center gap-1"><ArrowRight :size="12" />Type</span></th>
               <th class="px-3 py-2">Target Entity</th>
               <th class="px-3 py-2 text-right">Confidence</th>
               <th class="px-3 py-2">Relation ID</th>
@@ -189,16 +183,28 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { useLogflayerStore } from '../../stores/logflayer'
 import { useUpsidegateStore } from '../../stores/upsidegate'
 import type { RelationType } from '../../types'
+import { X, Share2, ArrowRight } from 'lucide-vue-next'
+import RelationGraph from '../../components/RelationGraph.vue'
 
 const store   = useLogflayerStore()
 const ugStore = useUpsidegateStore()
+const router  = useRouter()
+
+function openDetached() {
+  const hash = ugStore.selected?.sample_hash
+  if (!hash) return
+  const href = router.resolve({ name: 'detached-graph', query: { hash } }).href
+  window.open(href, `vecta-graph-${hash}`, 'width=1280,height=860,noopener')
+}
 
 const sampleHash      = ref('')
 const openSamplePicker = ref(false)
 const targetIdFilter  = ref('')
+const showGraphModal  = ref(false)
 
 const RELATION_TYPES: RelationType[] = [
   'TRIGGERED_BY', 'GENERATED', 'INFORMED', 'FOLLOWED_BY',
@@ -213,12 +219,6 @@ const uniqueEntityIds = computed(() => {
   }
   return [...ids]
 })
-
-function nodeX(idx: number) {
-  const total = uniqueEntityIds.value.length
-  const gap   = Math.max(600, total * 120) / Math.max(total, 1)
-  return gap * idx + gap / 2
-}
 
 function entityLabel(eid: string): string {
   const e = ugStore.entities.find(x => x.entity_id === eid)
@@ -266,3 +266,14 @@ onMounted(async () => {
   await ugStore.fetchMetadata({ limit: 20, page: 1 })
 })
 </script>
+
+<style scoped>
+.rg-fade-enter-active,
+.rg-fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+.rg-fade-enter-from,
+.rg-fade-leave-to {
+  opacity: 0;
+}
+</style>
