@@ -94,18 +94,71 @@
         </div>
       </div>
 
+      <!-- Traversal banner — shown while a server-side expansion overrides the
+           sample-scoped view. -->
+      <div
+        v-if="ugStore.expansion"
+        class="card border-[#00d4ff]/40 bg-[#00d4ff]/5 text-sm flex items-center justify-between gap-4"
+      >
+        <div class="flex items-center gap-2 min-w-0">
+          <Waypoints :size="16" class="text-[#00d4ff] shrink-0" />
+          <span class="text-[rgba(245,245,220,0.70)] truncate">
+            Showing
+            <span class="text-[#00d4ff]">{{ ugStore.expansion.direction }}</span>
+            traversal from
+            <code class="text-xs">{{ ugStore.expansion.root.slice(0, 12) }}</code>
+            — {{ ugStore.expansion.node_count }} entities,
+            {{ ugStore.expansion.edge_count }} edges,
+            depth {{ ugStore.expansion.depth_reached }}
+          </span>
+        </div>
+        <div class="flex items-center gap-3 shrink-0">
+          <span v-if="ugStore.expansion.truncated" class="text-[#f59e0b] text-xs">
+            truncated at the node limit
+          </span>
+          <button
+            @click="ugStore.clearExpansion()"
+            class="text-[rgba(245,245,220,0.50)] hover:text-[#f5f5dc] inline-flex items-center gap-1 text-xs"
+          >
+            <X :size="13" />Back to sample
+          </button>
+        </div>
+      </div>
+
+      <div v-if="ugStore.expansionError" class="card border-[#f59e0b]/50 bg-[#f59e0b]/10 text-[#f59e0b] text-sm flex items-center justify-between">
+        <span>{{ ugStore.expansionError }}</span>
+        <button @click="ugStore.clearExpansion()" class="hover:text-[#f5f5dc]"><X :size="14" /></button>
+      </div>
+
       <!-- Force-directed relation graph -->
-      <div v-if="ugStore.filteredRelations.length > 0" class="card">
+      <div v-if="ugStore.graphRelations.length > 0" class="card">
         <div class="text-xs text-[rgba(245,245,220,0.40)] mb-3 flex items-center justify-between">
           <span>Drag · scroll to zoom · double-click node or edge for data · triple-click to pin</span>
-          <span>{{ uniqueEntityIds.length }} entities · {{ ugStore.filteredRelations.length }} relations</span>
+          <span class="flex items-center gap-2">
+            <span v-if="ugStore.expanding" class="text-[#00d4ff]">traversing…</span>
+            <span>{{ uniqueEntityIds.length }} entities · {{ ugStore.graphRelations.length }} relations</span>
+          </span>
         </div>
         <RelationGraph
-          :relations="ugStore.filteredRelations"
-          :entities="ugStore.entities"
+          :relations="ugStore.graphRelations"
+          :entities="ugStore.graphEntities"
           @expand="showGraphModal = true"
           @detach="openDetached"
+          @traverse-downstream="id => ugStore.expandDownstream(id, traversalDepth)"
+          @traverse-upstream="id => ugStore.expandUpstream(id, traversalDepth)"
         />
+      </div>
+
+      <!-- A traversal that found no edges — e.g. expanding a leaf downstream.
+           Distinct from "this sample has no relations", so say which it is. -->
+      <div
+        v-else-if="ugStore.expansion"
+        class="card text-center py-10 text-sm text-[rgba(245,245,220,0.40)]"
+      >
+        <div class="flex justify-center mb-3"><Waypoints :size="28" class="text-[rgba(245,245,220,0.25)]" /></div>
+        No {{ ugStore.expansion.direction }} edges from
+        <code class="text-xs">{{ ugStore.expansion.root.slice(0, 12) }}</code> —
+        it is a {{ ugStore.expansion.direction === 'downstream' ? 'leaf' : 'root' }} in the graph.
       </div>
 
       <!-- Expanded graph pop-up -->
@@ -121,7 +174,7 @@
                 <div>
                   <h2 class="text-sm font-semibold text-[#f5f5dc]">Relation Graph</h2>
                   <div class="text-xs text-[rgba(245,245,220,0.40)] mt-0.5">
-                    {{ uniqueEntityIds.length }} entities · {{ ugStore.filteredRelations.length }} relations —
+                    {{ uniqueEntityIds.length }} entities · {{ ugStore.graphRelations.length }} relations —
                     scroll to zoom, drag nodes, drag canvas to pan, triple-click to pin
                   </div>
                 </div>
@@ -134,9 +187,11 @@
               </div>
               <div class="flex-1 min-h-0">
                 <RelationGraph
-                  :relations="ugStore.filteredRelations"
-                  :entities="ugStore.entities"
+                  :relations="ugStore.graphRelations"
+                  :entities="ugStore.graphEntities"
                   expanded
+                  @traverse-downstream="id => ugStore.expandDownstream(id, traversalDepth)"
+                  @traverse-upstream="id => ugStore.expandUpstream(id, traversalDepth)"
                 />
               </div>
             </div>
@@ -187,7 +242,7 @@ import { useRouter } from 'vue-router'
 import { useLogflayerStore } from '../../stores/logflayer'
 import { useUpsidegateStore } from '../../stores/upsidegate'
 import type { RelationType } from '../../types'
-import { X, Share2, ArrowRight } from 'lucide-vue-next'
+import { X, Share2, ArrowRight, Waypoints } from 'lucide-vue-next'
 import RelationGraph from '../../components/RelationGraph.vue'
 
 const store   = useLogflayerStore()
@@ -205,15 +260,20 @@ const sampleHash      = ref('')
 const openSamplePicker = ref(false)
 const targetIdFilter  = ref('')
 const showGraphModal  = ref(false)
+/** Hops requested when expanding a node. Two is enough to show a node's
+ *  neighbourhood without pulling in most of the graph. */
+const traversalDepth  = 2
 
 const RELATION_TYPES: RelationType[] = [
   'TRIGGERED_BY', 'GENERATED', 'INFORMED', 'FOLLOWED_BY',
   'RESPONDED_TO', 'ASSEMBLED_FROM', 'PART_OF', 'DELEGATED_TO',
 ]
 
+// Counts whatever the graph is currently drawing — the traversal when one is
+// active, otherwise the sample's own relations.
 const uniqueEntityIds = computed(() => {
   const ids = new Set<string>()
-  for (const r of ugStore.filteredRelations) {
+  for (const r of ugStore.graphRelations) {
     ids.add(r.source_entity_id)
     ids.add(r.target_entity_id)
   }
@@ -221,7 +281,7 @@ const uniqueEntityIds = computed(() => {
 })
 
 function entityLabel(eid: string): string {
-  const e = ugStore.entities.find(x => x.entity_id === eid)
+  const e = ugStore.graphEntities.find(x => x.entity_id === eid)
   if (!e) return eid.slice(0, 12) + '…'
   const base = e.tool_name ?? e.entity_type
   return `${base} (${eid.slice(0, 6)})`

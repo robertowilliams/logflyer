@@ -4,6 +4,7 @@ import { client } from '../api/client'
 import type {
   SampleMetadata, EntityRecord, RelationEdge, ProvTriple, OtelSpan,
   EntityType, RelationType, SpanKind, SpanStatusCode,
+  GraphTraversal, GraphPath,
 } from '../types'
 
 export const useUpsidegateStore = defineStore('upsidegate', () => {
@@ -151,6 +152,9 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     // prefer them over the client-synthesised fallbacks.  Errors are
     // swallowed because the graph writer is opt-in on the server and a
     // 404 / empty page just means "fall back to client synthesis."
+    // A traversal belongs to the sample it was launched from; carrying it into
+    // a different sample would leave the graph showing unrelated entities.
+    clearExpansion()
     if (selected.value) {
       void fetchServerOutputs(hash)
     } else {
@@ -192,8 +196,112 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     serverDataAvailable.value = false
   }
 
+  // ── Graph traversal (server-side BFS) ─────────────────────────────────────
+  // /relations is scoped to one sample; these follow `entity_edges` wherever
+  // they lead.  When a traversal is active the graph view renders it instead of
+  // the sample's own relations, so `expansion` acts as an overlay that
+  // `clearExpansion` removes to return to the sample-scoped view.
+  const expansion      = ref<GraphTraversal | null>(null)
+  const expanding      = ref(false)
+  const expansionError = ref<string | null>(null)
+
+  /** Edges the graph should draw: the active traversal if there is one,
+   *  otherwise the selected sample's own relations.
+   *
+   *  The relation-type filter applies to both, so the control does not appear
+   *  to stop working the moment a traversal is active. */
+  const graphRelations = computed<RelationEdge[]>(() => {
+    const source = expansion.value ? expansion.value.edges : relations.value
+    if (!filterRelationType.value) return source
+    return source.filter(r => r.relation_type === filterRelationType.value)
+  })
+
+  /** Entities the graph should label nodes with — the traversal's hydrated
+   *  records when expanded, since they may span samples. */
+  const graphEntities = computed<EntityRecord[]>(() =>
+    expansion.value ? expansion.value.entities : entities.value,
+  )
+
+  /** Walk outbound edges from `entityId` ("what did this cause?").
+   *  Accepts a bare id or a `ug:entity:` URI. */
+  async function expandDownstream(entityId: string, depth = 2) {
+    await runExpansion(() => client.getDownstream(entityId, depth))
+  }
+
+  /** Walk inbound edges into `entityId` ("what caused this?"). */
+  async function expandUpstream(entityId: string, depth = 2) {
+    await runExpansion(() => client.getUpstream(entityId, depth))
+  }
+
+  /** Resolve the shortest directed path between two entities.
+   *  Returns the response so callers can distinguish "no path" (`found:
+   *  false`) from a request failure (`null`). */
+  async function findPath(from: string, to: string, maxDepth = 6): Promise<GraphPath | null> {
+    try {
+      expanding.value = true; expansionError.value = null
+      const res = await client.getGraphPath(from, to, maxDepth)
+      if (res.found) {
+        // Reuse the expansion overlay so the path renders in the same graph.
+        expansion.value = {
+          root:          res.from,
+          direction:     'downstream',
+          depth_reached: res.hop_count,
+          edges:         res.edges,
+          entities:      res.entities,
+          node_ids:      res.node_ids,
+          node_count:    res.node_ids.length,
+          edge_count:    res.edges.length,
+          truncated:     res.truncated,
+        }
+      } else if (res.truncated) {
+        // The search hit a budget, so "no path" is not a safe conclusion.
+        expansionError.value =
+          'Search was truncated before finishing — the entities may still be connected. Try a smaller depth.'
+      } else {
+        expansionError.value = 'No path found between those entities.'
+      }
+      return res
+    } catch (e: any) {
+      expansionError.value = e.message ?? 'Path lookup failed'
+      return null
+    } finally {
+      expanding.value = false
+    }
+  }
+
+  async function runExpansion(fetcher: () => Promise<GraphTraversal>) {
+    try {
+      expanding.value = true; expansionError.value = null
+      expansion.value = await fetcher()
+    } catch (e: any) {
+      // Leave any previous expansion in place — a failed expand should not
+      // blank out a graph the user is already looking at.
+      expansionError.value = e.message ?? 'Traversal failed'
+    } finally {
+      expanding.value = false
+    }
+  }
+
+  /** Drop the traversal overlay and fall back to the sample-scoped view. */
+  function clearExpansion() {
+    expansion.value = null
+    expansionError.value = null
+  }
+
+  /** Resolve a single entity that is not in the loaded sample.
+   *  Returns `null` on 404 or error — callers fall back to showing the id. */
+  async function resolveEntity(entityId: string): Promise<EntityRecord | null> {
+    try {
+      const res = await client.getEntity(entityId)
+      return res.entity
+    } catch {
+      return null
+    }
+  }
+
   function selectMetadata(meta: SampleMetadata | null) {
     selected.value = meta
+    clearExpansion()
     if (meta) {
       void fetchServerOutputs(meta.sample_hash)
     } else {
@@ -248,6 +356,10 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     entities, relations, provTriples, otelSpans,
     filteredEntities, filteredRelations,
     entityTypeCounts, relationTypeCounts,
+    // graph traversal
+    expansion, expanding, expansionError,
+    graphRelations, graphEntities,
+    expandDownstream, expandUpstream, findPath, clearExpansion, resolveEntity,
     // actions
     fetchMetadata, fetchMetadataByHash, fetchServerOutputs, clearServerOutputs,
     selectMetadata, clearError,

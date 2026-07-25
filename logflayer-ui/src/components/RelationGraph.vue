@@ -9,6 +9,7 @@
 import { ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import {
   Plus, Minus, RotateCcw, Crosshair, Maximize2, ExternalLink, X, Copy, Check, CircleDot, Waypoints,
+  ArrowUpLeft, ArrowDownRight,
 } from 'lucide-vue-next'
 import type { RelationEdge, EntityRecord } from '../types'
 
@@ -20,7 +21,14 @@ const props = withDefaults(
   }>(),
   { expanded: false },
 )
-const emit = defineEmits<{ expand: []; detach: [] }>()
+const emit = defineEmits<{
+  expand: []
+  detach: []
+  /** Ask the parent to run a server-side traversal from this entity id.
+   *  The component stays presentational — it never fetches. */
+  'traverse-downstream': [entityId: string]
+  'traverse-upstream': [entityId: string]
+}>()
 
 // ── Coordinate space (SVG scales to container width via viewBox) ──────────────
 const W = 820
@@ -101,6 +109,17 @@ function build() {
     }
   })
   links.value = newLinks
+
+  // Any open detail window refers to the *previous* arrays. `edgeIndex` is a
+  // positional index, so leaving it set would silently retarget the window at
+  // whatever relation now occupies that slot — very reachable now that a
+  // traversal swaps `props.relations` wholesale on a click. Drop a node
+  // selection too if that node is no longer in the graph.
+  edgeIndex.value = null
+  if (detailId.value && !index.has(detailId.value)) {
+    detailId.value = null
+  }
+
   reheat()
 }
 
@@ -655,6 +674,29 @@ const detailRows = computed(() => {
         </div>
         <button class="text-[rgba(245,245,220,0.45)] hover:text-[#f5f5dc] shrink-0" title="Close" @click="closeDetail">
           <X :size="14" />
+        </button>
+      </div>
+
+      <!-- Traversal actions — ask the server to follow this node's edges beyond
+           the currently-loaded sample. -->
+      <div class="flex items-center gap-1 px-3 py-2 border-b border-[#222]">
+        <button
+          class="flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded text-[11px]
+                 bg-[#00d4ff]/10 border border-[#00d4ff]/30 text-[#00d4ff]
+                 hover:bg-[#00d4ff]/20 transition-colors"
+          title="Follow inbound edges — what led to this entity"
+          @click="detailId && emit('traverse-upstream', detailId)"
+        >
+          <ArrowUpLeft :size="12" />Upstream
+        </button>
+        <button
+          class="flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded text-[11px]
+                 bg-[#dc143c]/10 border border-[#dc143c]/30 text-[#ff6b8a]
+                 hover:bg-[#dc143c]/20 transition-colors"
+          title="Follow outbound edges — what this entity led to"
+          @click="detailId && emit('traverse-downstream', detailId)"
+        >
+          Downstream<ArrowDownRight :size="12" />
         </button>
       </div>
 

@@ -136,10 +136,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useLogflayerStore } from '../../stores/logflayer'
 import { useUpsidegateStore } from '../../stores/upsidegate'
-import type { ProvPredicate } from '../../types'
+import type { ProvPredicate, EntityRecord } from '../../types'
 import { RefreshCw, ChevronLeft, ChevronRight } from 'lucide-vue-next'
 
 const store   = useLogflayerStore()
@@ -164,14 +164,60 @@ function fmt(ts: string) {
   try { return new Date(ts).toLocaleString() } catch { return ts }
 }
 
-/** Server-side PROV triples carry URIs like `ug:entity:{id}` / `ug:activity:{id}`
- *  / `ug:agent:{id}`; client-synthesised triples carry bare entity IDs.  Strip
- *  the prefix before looking up so both render correctly. */
-function entityLabel(uriOrId: string): string {
-  const id = uriOrId.replace(/^ug:(entity|activity|agent):/, '')
-  const e = ugStore.entities.find(x => x.entity_id === id)
-  return e ? (e.tool_name ?? e.entity_type) : '?'
+// ── Cross-sample entity resolution ──────────────────────────────────────────
+// PROV triples reference entities by URI, and those references routinely point
+// outside the currently-loaded sample. Rather than rendering '?', resolve the
+// unknown ids through GET /api/v1/entities/:id and cache the results.
+//
+// `null` is cached too: it marks "asked, and the server has no such entity", so
+// a missing entity is not re-requested on every re-render.
+const resolved = ref<Record<string, EntityRecord | null>>({})
+const pending = new Set<string>()
+
+/** Strip the PROV URI prefix. Server-side triples carry `ug:entity:{id}` /
+ *  `ug:activity:{id}` / `ug:agent:{id}`; client-synthesised ones carry bare
+ *  entity ids, so both spellings must resolve. */
+function bareId(uriOrId: string): string {
+  return uriOrId.replace(/^ug:(entity|activity|agent):/, '')
 }
+
+function entityLabel(uriOrId: string): string {
+  const id = bareId(uriOrId)
+  const local = ugStore.entities.find(x => x.entity_id === id)
+  if (local) return local.tool_name ?? local.entity_type
+
+  const fetched = resolved.value[id]
+  if (fetched) return fetched.tool_name ?? fetched.entity_type
+  // Distinguish "not loaded yet" from "server has no record for this id".
+  return id in resolved.value ? '—' : '…'
+}
+
+/** Fetch every referenced entity that is not already local or cached.
+ *  Runs whenever the triple list changes. */
+async function resolveMissing() {
+  const ids = new Set<string>()
+  for (const t of ugStore.provTriples) {
+    for (const ref of [t.subject, t.object]) {
+      const id = bareId(ref)
+      if (!id) continue
+      if (ugStore.entities.some(e => e.entity_id === id)) continue
+      if (id in resolved.value || pending.has(id)) continue
+      ids.add(id)
+    }
+  }
+  if (ids.size === 0) return
+
+  for (const id of ids) pending.add(id)
+  await Promise.all(
+    [...ids].map(async id => {
+      const entity = await ugStore.resolveEntity(id)
+      resolved.value = { ...resolved.value, [id]: entity }
+      pending.delete(id)
+    }),
+  )
+}
+
+watch(() => ugStore.provTriples, () => { void resolveMissing() }, { immediate: true })
 
 function predicateClass(p: string) {
   const map: Record<string, string> = {
