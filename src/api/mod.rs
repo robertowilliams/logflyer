@@ -15,6 +15,8 @@ use crate::repository::MongoRepository;
 pub mod admin;
 pub mod classifications;
 pub mod deletions;
+pub mod entities;
+pub mod graph;
 pub mod logs;
 pub mod metadata;
 pub mod prov;
@@ -66,6 +68,13 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/relations", get(relations::list))
         .route("/api/v1/prov",      get(prov::list))
         .route("/api/v1/spans",     get(spans::list))
+        .route("/api/v1/entities/:entity_id", get(entities::get_one))
+        // ── Graph traversal ───────────────────────────────────────────────────
+        // `path` takes its endpoints as query params rather than a path segment,
+        // so it cannot collide with the `:entity_id` traversals below.
+        .route("/api/v1/graph/path",                  get(graph::path))
+        .route("/api/v1/graph/downstream/:entity_id", get(graph::downstream))
+        .route("/api/v1/graph/upstream/:entity_id",   get(graph::upstream))
         .route("/api/v1/admin/settings",                  get(admin::get_settings).put(admin::put_settings))
         .route("/api/v1/admin/settings/history",          get(admin::get_settings_history))
         .route("/api/v1/admin/settings/restore/:version", post(admin::post_settings_restore))
