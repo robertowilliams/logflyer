@@ -3,7 +3,8 @@ import type {
   Target, SampleRecord, TrackingRecord, HealthResponse,
   PagedResponse, TargetsResponse, ClassificationRecord,
   AdminSettings, SettingsResponse, HistoryEntry,
-  SampleMetadata, DeletionRecord,
+  SampleMetadata, DeletionRecord, EntityRecord,
+  GraphTraversal, GraphPath,
 } from '../types'
 
 class LogflayerClient {
@@ -159,6 +160,43 @@ class LogflayerClient {
     limit?: number; page?: number
   }): Promise<PagedResponse<unknown>> {
     const { data } = await this.http.get('/api/v1/spans', { params })
+    return data
+  }
+
+  // ── Entity lookup ─────────────────────────────────────────────────────────
+  // Resolves an entity that is not in the currently-loaded sample's
+  // `metadata.entities` array — which happens as soon as a relation or PROV
+  // triple points across samples.  Accepts a bare entity_id or the
+  // `ug:entity:{id}` URI form; the backend strips the prefix.
+  async getEntity(entityId: string): Promise<{ entity: EntityRecord }> {
+    const { data } = await this.http.get(`/api/v1/entities/${encodeURIComponent(entityId)}`)
+    return data
+  }
+
+  // ── Graph traversal ───────────────────────────────────────────────────────
+  // Server-side BFS over the `entity_edges` collection. Unlike /relations,
+  // which is scoped to one sample, these follow edges wherever they lead, so
+  // the graph view can expand beyond the selected sample.
+  async getDownstream(entityId: string, depth = 2): Promise<GraphTraversal> {
+    const { data } = await this.http.get(
+      `/api/v1/graph/downstream/${encodeURIComponent(entityId)}`,
+      { params: { depth } },
+    )
+    return data
+  }
+
+  async getUpstream(entityId: string, depth = 2): Promise<GraphTraversal> {
+    const { data } = await this.http.get(
+      `/api/v1/graph/upstream/${encodeURIComponent(entityId)}`,
+      { params: { depth } },
+    )
+    return data
+  }
+
+  async getGraphPath(from: string, to: string, maxDepth = 6): Promise<GraphPath> {
+    const { data } = await this.http.get('/api/v1/graph/path', {
+      params: { from, to, max_depth: maxDepth },
+    })
     return data
   }
 

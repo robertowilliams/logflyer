@@ -245,6 +245,61 @@ export interface RelationEdge {
   created_at:       string
 }
 
+// ─── Graph traversal (GET /api/v1/graph/*) ───────────────────────────────────
+
+/** Which way `GET /api/v1/graph/{downstream,upstream}` walked the edge set. */
+export type GraphDirection = 'downstream' | 'upstream'
+
+/**
+ * Response of `GET /api/v1/graph/downstream|upstream/:entity_id`.
+ *
+ * `edges` + `entities` are deliberately shaped to match `RelationGraph`'s
+ * props, so a traversal result can be handed to the component directly.
+ */
+export interface GraphTraversal {
+  /** The entity the walk started from, with any `ug:entity:` prefix stripped. */
+  root:          string
+  direction:     GraphDirection
+  /** Levels actually walked — lower than the requested depth when the
+   *  frontier emptied first. */
+  depth_reached: number
+  edges:         RelationEdge[]
+  entities:      EntityRecord[]
+  node_ids:      string[]
+  node_count:    number
+  edge_count:    number
+  /** True when the server's node budget stopped the walk early. */
+  truncated:     boolean
+}
+
+/** One hop of a resolved path, mirroring `graph_query::PathHop`. */
+export interface PathHop {
+  relation_id: string
+  from:        string
+  to:          string
+}
+
+/**
+ * Response of `GET /api/v1/graph/path`.
+ *
+ * An unreachable pair returns `200` with `found: false` — it is a legitimate
+ * answer rather than an error.
+ */
+export interface GraphPath {
+  found:     boolean
+  /** True when the search hit a server budget. With `found: false` this means
+   *  "we stopped looking", not "there is no path" — the two are different
+   *  claims and must not be collapsed. */
+  truncated: boolean
+  from:      string
+  to:        string
+  hops:      PathHop[]
+  hop_count: number
+  edges:     RelationEdge[]
+  entities:  EntityRecord[]
+  node_ids:  string[]
+}
+
 /** Mirror of `prov_linker::ProvTriple`. */
 export interface ProvTriple {
   subject:     string
