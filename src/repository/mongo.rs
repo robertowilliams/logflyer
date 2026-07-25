@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use mongodb::bson::{self, doc, Bson, DateTime, Document};
@@ -8,9 +8,14 @@ use mongodb::options::{
     ReplaceOptions,
 };
 use mongodb::{Client, Collection, Database, IndexModel};
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
+use tracing::warn;
 
+use super::graph_query::{
+    shortest_path, Direction, EdgeEndpoints, PathHop, Traversal, MAX_EDGES,
+};
 use crate::config::{ConfigHistoryConfig, MongoConfig};
 use crate::config_history;
 use crate::error::AppError;
@@ -1227,6 +1232,432 @@ impl MongoRepository {
 
         Ok((out, total))
     }
+
+    // ─── Entity lookup ────────────────────────────────────────────────────────
+
+    /// Fetch a single [`EntityRecord`] by its `entity_id`.
+    ///
+    /// Entities are not stored in a collection of their own — they live in the
+    /// `entities` array of the owning `sample_metadata` document.  This uses a
+    /// positional projection (`entities.$`) so Mongo returns only the matching
+    /// array element instead of shipping every entity in the sample across the
+    /// wire.
+    ///
+    /// Accepts either a bare `entity_id` or the PROV URI form
+    /// `ug:entity:{entity_id}`, since the frontend holds URIs in PROV views and
+    /// bare ids in entity views.
+    ///
+    /// Returns `None` when no sample contains that entity.
+    ///
+    /// [`EntityRecord`]: crate::models::EntityRecord
+    pub async fn fetch_entity_by_id(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<JsonValue>, AppError> {
+        let entity_id = strip_entity_uri(entity_id);
+        self.ensure_entity_id_index().await;
+
+        let col = self
+            .destination_database
+            .collection::<Document>("sample_metadata");
+
+        let opts = FindOneOptions::builder()
+            .projection(doc! { "entities.$": 1, "sample_hash": 1 })
+            .build();
+
+        let Some(doc) = col
+            .find_one(doc! { "entities.entity_id": entity_id }, opts)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        // The positional projection should return exactly the matching element,
+        // but that guarantee is the server's, not ours — and it silently lapses
+        // if the filter is ever changed in a way Mongo cannot project
+        // positionally.  Confirm the id before trusting it, so a lapse becomes a
+        // 404 rather than a confidently wrong entity.
+        let entity = doc
+            .get_array("entities")
+            .ok()
+            .and_then(|arr| arr.first())
+            .and_then(Bson::as_document)
+            .filter(|d| d.get_str("entity_id") == Ok(entity_id))
+            .cloned();
+
+        Ok(entity.map(bson_doc_to_json))
+    }
+
+    /// Fetch many [`EntityRecord`]s by id in one round trip.
+    ///
+    /// Used to hydrate traversal results: BFS yields entity *ids*, but the UI
+    /// needs labels and types, so the ids are resolved in a single aggregation
+    /// rather than N positional-projection queries.
+    ///
+    /// Ids that do not resolve are silently absent from the result — a
+    /// traversal can legitimately reach an edge endpoint whose entity document
+    /// was deleted, and a missing label should not fail the whole request.
+    ///
+    /// [`EntityRecord`]: crate::models::EntityRecord
+    pub async fn fetch_entities_by_ids(
+        &self,
+        entity_ids: &[String],
+    ) -> Result<Vec<JsonValue>, AppError> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_entity_id_index().await;
+
+        let ids: Vec<&str> = entity_ids.iter().map(String::as_str).collect();
+        let col = self
+            .destination_database
+            .collection::<Document>("sample_metadata");
+
+        // $match narrows to candidate samples on the index, $unwind explodes the
+        // arrays, and the second $match keeps only the entities we asked for.
+        let pipeline = vec![
+            doc! { "$match":       { "entities.entity_id": { "$in": &ids } } },
+            doc! { "$unwind":      "$entities" },
+            doc! { "$match":       { "entities.entity_id": { "$in": &ids } } },
+            doc! { "$replaceRoot": { "newRoot": "$entities" } },
+        ];
+
+        let mut cursor = col.aggregate(pipeline, None).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok(out)
+    }
+
+    // ─── Graph traversal ──────────────────────────────────────────────────────
+
+    /// Breadth-first walk of `entity_edges` from `root`, following `direction`.
+    ///
+    /// Issues one indexed query per depth level (matching the frontier with
+    /// `$in`) rather than one per node, so a wide graph costs the same number of
+    /// round trips as a narrow one.
+    ///
+    /// Returns the full edge documents in discovery order, the entity records
+    /// for every visited node, and whether the [`MAX_NODES`] budget truncated
+    /// the walk.
+    ///
+    /// [`MAX_NODES`]: super::graph_query::MAX_NODES
+    pub async fn traverse_graph(
+        &self,
+        root: &str,
+        direction: Direction,
+        depth: u32,
+    ) -> Result<TraversalResult, AppError> {
+        let walk = self.walk_edges(root, direction, depth).await?;
+        let entities = self.fetch_entities_by_ids(&walk.node_ids).await?;
+
+        Ok(TraversalResult {
+            root: walk.root,
+            direction,
+            depth_reached: walk.depth_reached,
+            edges: walk.edges,
+            entities,
+            node_ids: walk.node_ids,
+            truncated: walk.truncated,
+        })
+    }
+
+    /// BFS over `entity_edges` without hydrating entity records.
+    ///
+    /// Split out of [`traverse_graph`](Self::traverse_graph) because
+    /// [`graph_path`](Self::graph_path) needs the edges but not the
+    /// neighbourhood's entities — hydrating up to [`MAX_NODES`] records only to
+    /// discard them costs a large `$in` aggregation per path request.
+    ///
+    /// [`MAX_NODES`]: super::graph_query::MAX_NODES
+    async fn walk_edges(
+        &self,
+        root: &str,
+        direction: Direction,
+        depth: u32,
+    ) -> Result<EdgeWalk, AppError> {
+        let root = strip_entity_uri(root);
+        let col = self
+            .destination_database
+            .collection::<Document>("entity_edges");
+
+        let mut traversal = Traversal::new(root, direction, depth);
+        // relation_id → full edge document, so edges can be returned in the
+        // order the traversal discovered them.
+        let mut edge_docs: HashMap<String, JsonValue> = HashMap::new();
+
+        while !traversal.is_done() {
+            let frontier: Vec<&str> = traversal.frontier().iter().map(String::as_str).collect();
+            let filter = doc! { direction.match_field(): { "$in": &frontier } };
+
+            // Cap the per-level fetch. Without this a single hub entity with a
+            // huge fan-out would be fully materialised as JSON before the
+            // traversal's own budget ever got a chance to stop it.
+            let remaining = MAX_EDGES.saturating_sub(edge_docs.len());
+            if remaining == 0 {
+                traversal.mark_truncated();
+                break;
+            }
+            let opts = FindOptions::builder()
+                .limit(remaining as i64)
+                .build();
+
+            let mut cursor = col.find(filter, opts).await?;
+            let mut level = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                let Some(endpoints) = edge_endpoints(&doc) else {
+                    // An edge missing an endpoint field cannot be traversed;
+                    // skip it rather than aborting the walk.
+                    continue;
+                };
+                edge_docs.insert(endpoints.relation_id.clone(), bson_doc_to_json(doc));
+                level.push(endpoints);
+            }
+            // A full page means Mongo had more to give: the graph is wider than
+            // the budget, so the result is partial.
+            if level.len() >= remaining {
+                traversal.mark_truncated();
+            }
+            traversal.absorb_level(&level);
+        }
+
+        let edges: Vec<JsonValue> = traversal
+            .edge_ids()
+            .iter()
+            .filter_map(|id| edge_docs.get(id).cloned())
+            .collect();
+
+        Ok(EdgeWalk {
+            root: root.to_string(),
+            depth_reached: traversal.depth_reached(),
+            truncated: traversal.truncated(),
+            edges,
+            node_ids: traversal.into_visited(),
+        })
+    }
+
+    /// Shortest directed path between two entities, or `None` if unreachable.
+    ///
+    /// Loads the edges reachable from `from` within `max_depth` hops, then runs
+    /// BFS over them in memory.  Pulling the neighbourhood first keeps this to
+    /// `max_depth` queries; running the search server-side would need
+    /// `$graphLookup`, which cannot report *which* edge it used for each hop —
+    /// and the edge identity is the point of a provenance path.
+    pub async fn graph_path(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: u32,
+    ) -> Result<PathOutcome, AppError> {
+        let from = strip_entity_uri(from);
+        let to = strip_entity_uri(to);
+
+        if from.is_empty() || to.is_empty() {
+            return Err(AppError::Validation(
+                "graph path requires non-empty `from` and `to`".to_string(),
+            ));
+        }
+
+        // Answer the degenerate case before paying for a traversal.
+        if from == to {
+            return Ok(PathOutcome::Found(PathResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                hops: Vec::new(),
+                edges: Vec::new(),
+                entities: self.fetch_entities_by_ids(&[from.to_string()]).await?,
+                node_ids: vec![from.to_string()],
+                truncated: false,
+            }));
+        }
+
+        // Collect the reachable neighbourhood's edges. Entity records are not
+        // hydrated here — only the nodes on the winning path need them.
+        let reachable = self
+            .walk_edges(from, Direction::Downstream, max_depth)
+            .await?;
+
+        let endpoints: Vec<EdgeEndpoints> = reachable
+            .edges
+            .iter()
+            .filter_map(json_edge_endpoints)
+            .collect();
+
+        let Some(hops) = shortest_path(&endpoints, from, to, max_depth) else {
+            // A truncated search cannot distinguish "no path" from "gave up",
+            // so say which one happened rather than asserting there is no path.
+            return Ok(if reachable.truncated {
+                PathOutcome::Truncated
+            } else {
+                PathOutcome::NotFound
+            });
+        };
+
+        // Return the edge documents for the chosen hops, in path order.
+        let hop_ids: HashSet<&str> = hops.iter().map(|h| h.relation_id.as_str()).collect();
+        let mut edges_by_id: HashMap<&str, &JsonValue> = HashMap::new();
+        for edge in &reachable.edges {
+            if let Some(id) = edge.get("relation_id").and_then(JsonValue::as_str) {
+                if hop_ids.contains(id) {
+                    edges_by_id.insert(id, edge);
+                }
+            }
+        }
+        let edges: Vec<JsonValue> = hops
+            .iter()
+            .filter_map(|h| edges_by_id.get(h.relation_id.as_str()).map(|e| (*e).clone()))
+            .collect();
+
+        // Nodes on the path only — not the whole neighbourhood we searched.
+        let mut node_ids = vec![from.to_string()];
+        node_ids.extend(hops.iter().map(|h| h.to.clone()));
+        let entities = self.fetch_entities_by_ids(&node_ids).await?;
+
+        Ok(PathOutcome::Found(PathResult {
+            from: from.to_string(),
+            to: to.to_string(),
+            hops,
+            edges,
+            entities,
+            node_ids,
+            truncated: reachable.truncated,
+        }))
+    }
+
+    /// Create the multikey index backing `entities.entity_id` lookups.
+    ///
+    /// Without it, every entity lookup is a full collection scan of
+    /// `sample_metadata`.  Tracked in the shared `indexed_collections` set so
+    /// the round trip happens once per process, matching the pattern used by
+    /// the other `ensure_*` helpers.
+    ///
+    /// Unlike those helpers this one runs on a **read** path, so a failure must
+    /// not fail the request: an operator running the API with read-only Mongo
+    /// credentials should still be able to query, just without the index.  The
+    /// error is logged and the marker set either way, so a rejected attempt is
+    /// not retried on every subsequent request.
+    async fn ensure_entity_id_index(&self) {
+        const MARKER: &str = "sample_metadata::entities.entity_id";
+        {
+            let guard = self.indexed_collections.lock().await;
+            if guard.contains(MARKER) {
+                return;
+            }
+        }
+
+        let result = self
+            .destination_database
+            .collection::<Document>("sample_metadata")
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "entities.entity_id": 1 })
+                    .options(
+                        IndexOptions::builder()
+                            .name(Some("sm_entities_entity_id".to_string()))
+                            .build(),
+                    )
+                    .build(),
+                None,
+            )
+            .await;
+
+        if let Err(e) = result {
+            warn!(
+                error = %e,
+                "could not create sm_entities_entity_id index; entity lookups \
+                 will fall back to a collection scan",
+            );
+        }
+
+        self.indexed_collections
+            .lock()
+            .await
+            .insert(MARKER.to_string());
+    }
+}
+
+// ─── Traversal result types ───────────────────────────────────────────────────
+
+/// Result of [`MongoRepository::traverse_graph`].
+///
+/// `edges` + `entities` are shaped to drop straight into the frontend's
+/// `RelationGraph` component, which takes exactly those two arrays.
+#[derive(Debug, Serialize)]
+pub struct TraversalResult {
+    pub root: String,
+    pub direction: Direction,
+    pub depth_reached: u32,
+    pub edges: Vec<JsonValue>,
+    pub entities: Vec<JsonValue>,
+    pub node_ids: Vec<String>,
+    pub truncated: bool,
+}
+
+/// Edges and nodes from a BFS walk, before entity hydration.
+struct EdgeWalk {
+    root: String,
+    depth_reached: u32,
+    truncated: bool,
+    edges: Vec<JsonValue>,
+    node_ids: Vec<String>,
+}
+
+/// Outcome of [`MongoRepository::graph_path`].
+///
+/// Three states rather than `Option`, because "searched exhaustively and found
+/// nothing" and "ran out of budget before finishing" are different answers and
+/// the caller should be able to tell the user which one it got.
+#[derive(Debug)]
+pub enum PathOutcome {
+    Found(PathResult),
+    /// Search completed; the target is genuinely unreachable within the depth.
+    NotFound,
+    /// Search hit a budget, so no conclusion about reachability is possible.
+    Truncated,
+}
+
+/// A resolved path between two entities.
+#[derive(Debug, Serialize)]
+pub struct PathResult {
+    pub from: String,
+    pub to: String,
+    pub hops: Vec<PathHop>,
+    pub edges: Vec<JsonValue>,
+    pub entities: Vec<JsonValue>,
+    pub node_ids: Vec<String>,
+    /// True when the neighbourhood search was truncated.  The returned path is
+    /// still valid, but a shorter one could in principle have been missed.
+    pub truncated: bool,
+}
+
+// ─── Edge helpers ─────────────────────────────────────────────────────────────
+
+/// Strip the `ug:entity:` PROV URI prefix, if present.
+///
+/// PROV views hold `ug:entity:{id}` while entity views hold the bare id; both
+/// reach these endpoints, so normalise on the way in.
+fn strip_entity_uri(id: &str) -> &str {
+    id.strip_prefix("ug:entity:").unwrap_or(id)
+}
+
+/// Pull the traversable endpoints out of a raw `entity_edges` BSON document.
+fn edge_endpoints(doc: &Document) -> Option<EdgeEndpoints> {
+    Some(EdgeEndpoints {
+        relation_id: doc.get_str("relation_id").ok()?.to_string(),
+        source_entity_id: doc.get_str("source_entity_id").ok()?.to_string(),
+        target_entity_id: doc.get_str("target_entity_id").ok()?.to_string(),
+    })
+}
+
+/// Same as [`edge_endpoints`] but for an already-converted JSON edge.
+fn json_edge_endpoints(edge: &JsonValue) -> Option<EdgeEndpoints> {
+    Some(EdgeEndpoints {
+        relation_id: edge.get("relation_id")?.as_str()?.to_string(),
+        source_entity_id: edge.get("source_entity_id")?.as_str()?.to_string(),
+        target_entity_id: edge.get("target_entity_id")?.as_str()?.to_string(),
+    })
 }
 
 // ─── BSON ↔ JSON helpers ──────────────────────────────────────────────────────
