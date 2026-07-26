@@ -17,6 +17,9 @@
 //! | 6 | AgentStep → nearest subsequent McpEvent | DelegatedTo | 0.7 | Inferred |
 //! | 7 | ContextWindow → each preceding non-CW entity | AssembledFrom | 1.0 | Inferred |
 //! | 8 | Every entity → its OTel trace_id | PartOf | 1.0 | Inferred |
+//! | 9 | Any entity → the entity holding its `parent_span_id` | RespondedTo | 1.0 | Explicit |
+
+use std::collections::HashMap;
 
 use mongodb::bson::DateTime;
 
@@ -78,7 +81,8 @@ pub fn extract(entities: &[EntityRecord], sample_hash: &str) -> Vec<RelationEdge
     emit_triggered_by(entities, sample_hash, &mut edges);   // Rule 2
     emit_generated(entities, sample_hash, &mut edges);      // Rule 3
     emit_informed(entities, sample_hash, &mut edges);       // Rule 4
-    emit_delegated_to(entities, sample_hash, &mut edges);   // Rule 6
+    emit_delegated_to(entities, sample_hash, &mut edges);    // Rule 6
+    emit_responded_to_via_parent(entities, sample_hash, &mut edges); // Rule 9
 
     edges
 }
@@ -186,6 +190,61 @@ fn emit_responded_to(
                 RelationSource::Inferred,
             ));
         }
+    }
+}
+
+// ─── Rule 9: RespondedTo via span parentage ──────────────────────────────────
+
+/// An entity responds to whichever entity the extractor made its span parent.
+///
+/// `child --RespondedTo--> parent`
+///
+/// This exists because MCP sessions otherwise produce **no** entity-to-entity
+/// edges at all. `entity_extractor`'s third pass already pairs each MCP response
+/// with its originating request — matching JSON-RPC ids — and records it as
+/// `parent_span_id`, but nothing turned that into a relation. The result was that
+/// a pure MCP log yielded N `McpEvent` entities and only N `PART_OF` edges, so
+/// the relation graph showed a set of disconnected nodes for the one input
+/// logflayer is most specifically built to ingest, even though the span waterfall
+/// nested them correctly.
+///
+/// Confidence is `1.0` and the source `Explicit`: this is not proximity
+/// guesswork, it is the parent link the extractor already established from the
+/// request/response id match.
+///
+/// Rule 1 covers the Prompt→Completion case by position and may reach the same
+/// conclusion; `make_edge`'s content-derived `relation_id` makes the duplicate
+/// collapse on upsert rather than double-counting.
+fn emit_responded_to_via_parent(
+    entities: &[EntityRecord],
+    sample_hash: &str,
+    edges: &mut Vec<RelationEdge>,
+) {
+    // span_id → entity_id, so a parent_span_id can be resolved to an entity.
+    let by_span: HashMap<&str, &str> = entities
+        .iter()
+        .map(|e| (e.span_id.as_str(), e.entity_id.as_str()))
+        .collect();
+
+    for e in entities {
+        let Some(parent_span) = e.parent_span_id.as_deref() else {
+            continue;
+        };
+        let Some(&parent_entity) = by_span.get(parent_span) else {
+            continue;
+        };
+        // A self-parented span would produce a self-loop.
+        if parent_entity == e.entity_id {
+            continue;
+        }
+        edges.push(make_edge(
+            RelationType::RespondedTo,
+            &e.entity_id,
+            parent_entity,
+            sample_hash,
+            1.0,
+            RelationSource::Explicit,
+        ));
     }
 }
 
@@ -929,5 +988,107 @@ mod tests {
         let ids1: Vec<&str> = edges1.iter().map(|e| e.relation_id.as_str()).collect();
         let ids2: Vec<&str> = edges2.iter().map(|e| e.relation_id.as_str()).collect();
         assert_eq!(ids1, ids2, "relation_ids must be stable across runs");
+    }
+
+    // ── Rule 9: RespondedTo via span parentage ───────────────────────────────
+
+    #[test]
+    fn parent_span_becomes_a_responded_to_edge() {
+        // The MCP case: two McpEvents where the second is the response, paired by
+        // the extractor via parent_span_id. Before Rule 9 these produced only
+        // PART_OF edges, leaving the relation graph disconnected.
+        let request = make_entity(EntityType::McpEvent, 0);
+        let mut response = make_entity(EntityType::McpEvent, 1);
+        response.parent_span_id = Some(request.span_id.clone());
+
+        let edges = extract(&[request.clone(), response.clone()], "testhash");
+
+        let edge = find_edge(
+            &edges,
+            &RelationType::RespondedTo,
+            &response.entity_id,
+            &request.entity_id,
+        )
+        .expect("response must have a RespondedTo edge to its request");
+        assert_eq!(edge.confidence, 1.0, "parent linkage is explicit, not inferred");
+        assert_eq!(edge.source, RelationSource::Explicit);
+    }
+
+    #[test]
+    fn mcp_only_sample_gets_entity_to_entity_edges() {
+        // Regression guard for the gap the smoke test exposed: a pure MCP session
+        // must produce more than just PART_OF.
+        let a = make_entity(EntityType::McpEvent, 0);
+        let mut b = make_entity(EntityType::McpEvent, 1);
+        b.parent_span_id = Some(a.span_id.clone());
+        let mut c = make_entity(EntityType::McpEvent, 2);
+        c.parent_span_id = Some(a.span_id.clone());
+
+        let edges = extract(&[a, b, c], "testhash");
+        let non_structural = edges
+            .iter()
+            .filter(|e| e.relation_type != RelationType::PartOf)
+            .count();
+        assert_eq!(non_structural, 2, "both children must link to their parent");
+    }
+
+    #[test]
+    fn entities_without_a_parent_span_produce_no_parent_edge() {
+        let a = make_entity(EntityType::McpEvent, 0);
+        let b = make_entity(EntityType::McpEvent, 1);
+        let edges = extract(&[a, b], "testhash");
+        assert_eq!(
+            count(&edges, &RelationType::RespondedTo),
+            0,
+            "no parent_span_id means no parent edge",
+        );
+    }
+
+    #[test]
+    fn dangling_parent_span_is_ignored() {
+        // A parent_span_id pointing at a span not present in this sample must not
+        // produce an edge to a non-existent entity — that is precisely the
+        // dangling-edge case that leaves unlabelled nodes in the graph.
+        let mut e = make_entity(EntityType::McpEvent, 0);
+        e.parent_span_id = Some("span9999".to_string());
+        let edges = extract(&[e], "testhash");
+        assert_eq!(count(&edges, &RelationType::RespondedTo), 0);
+    }
+
+    #[test]
+    fn self_parented_span_does_not_create_a_self_loop() {
+        let mut e = make_entity(EntityType::McpEvent, 0);
+        e.parent_span_id = Some(e.span_id.clone());
+        let edges = extract(&[e], "testhash");
+        assert_eq!(count(&edges, &RelationType::RespondedTo), 0);
+    }
+
+    #[test]
+    fn rule_1_and_rule_9_agreeing_collapse_to_one_edge() {
+        // Prompt→Completion is reachable by position (Rule 1) and by parentage
+        // (Rule 9). Both emit the same (type, source, target), so the
+        // content-derived relation_id must make them identical rather than
+        // double-counting the same fact.
+        let prompt = make_entity(EntityType::PromptEvent, 0);
+        let mut completion = make_entity(EntityType::CompletionEvent, 1);
+        completion.parent_span_id = Some(prompt.span_id.clone());
+
+        let edges = extract(&[prompt.clone(), completion.clone()], "testhash");
+        let responded: Vec<_> = edges
+            .iter()
+            .filter(|e| {
+                e.relation_type == RelationType::RespondedTo
+                    && e.source_entity_id == completion.entity_id
+                    && e.target_entity_id == prompt.entity_id
+            })
+            .collect();
+        assert!(!responded.is_empty(), "the edge must exist");
+        let unique: std::collections::HashSet<&str> =
+            responded.iter().map(|e| e.relation_id.as_str()).collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "duplicates must share a relation_id so the upsert collapses them",
+        );
     }
 }
