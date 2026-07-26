@@ -259,6 +259,9 @@ fn extract_lines(
             timestamp_utc,
             content_embedding_id: None,
             behavioral_embedding_id: None,
+            // Stage 11 fills these in; the extractor has no notion of tasks.
+            task_id: String::new(),
+            correlation_key: None,
         });
     }
 }
@@ -283,14 +286,17 @@ fn detect_entity_type(line: &str) -> EntityType {
 
 // ── Pass 2: field extraction ──────────────────────────────────────────────────
 
-fn extract_json_fields(line: &str) -> HashMap<String, Value> {
+/// Exposed to `task_correlator`, which needs the same field parsing over *all*
+/// lines rather than only the ones that become entities.
+pub(crate) fn extract_json_fields(line: &str) -> HashMap<String, Value> {
     match serde_json::from_str::<Value>(line) {
         Ok(Value::Object(map)) => map.into_iter().collect(),
         _ => HashMap::new(),
     }
 }
 
-fn extract_logfmt_fields(line: &str) -> HashMap<String, Value> {
+/// See [`extract_json_fields`] for why this is `pub(crate)`.
+pub(crate) fn extract_logfmt_fields(line: &str) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     for cap in LOGFMT_RE.captures_iter(line) {
         let key = cap[1].to_string();

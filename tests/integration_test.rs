@@ -59,6 +59,7 @@ fn default_preprocessing_config() -> PreprocessingConfig {
         // 0 disables the persistence gate: write outputs for any sample with
         // at least one entity, so fixtures do not need to be large.
         min_entities_for_persist: 0,
+        task_correlation_enabled: true,
     }
 }
 
@@ -627,6 +628,197 @@ async fn test_graph_path_resolves_and_reports_absence() {
         repo.graph_path("", &edge.target_entity_id, 6).await.is_err(),
         "empty `from` is a caller error, not an empty result"
     );
+}
+
+// ─── Tasks (Stage 11) ─────────────────────────────────────────────────────────
+
+/// Fold a sample into its task the way the service does, and return the correlation.
+async fn fold_into_task(
+    repo: &MongoRepository,
+    hash: &str,
+    target: &str,
+    fixture_name: &str,
+) -> logflayer::preprocessing::task_correlator::TaskCorrelation {
+    let content = fixture(fixture_name);
+    let out = Preprocessor::new(default_preprocessing_config()).run(hash, target, &content);
+    let correlation = out.task_correlation.clone().expect("correlation enabled in tests");
+    repo.store_metadata(&out.metadata).await.expect("store metadata");
+
+    let counted = repo
+        .task_sample_counted(&correlation.task_id, hash)
+        .await
+        .expect("membership check");
+    let (ed, rd) = if counted {
+        (0, 0)
+    } else {
+        (out.metadata.entity_count, out.metadata.relation_count)
+    };
+
+    repo.upsert_task(
+        &correlation.task_id,
+        &correlation.source,
+        correlation.correlation_key.as_deref(),
+        hash,
+        &out.metadata.otel_trace_id,
+        target,
+        ed,
+        rd,
+    )
+    .await
+    .expect("upsert task");
+
+    correlation
+}
+
+/// The property the whole phase exists for: two samples sharing a correlation key
+/// must accumulate into **one** task document, in either arrival order.
+#[tokio::test]
+async fn test_task_accumulates_across_samples() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    // Same fixture, two different sample hashes — so the same session id.
+    let a = fold_into_task(&repo, "hash-task-a", "tgt-task", "langchain_json.log").await;
+    let b = fold_into_task(&repo, "hash-task-b", "tgt-task", "langchain_json.log").await;
+
+    assert_eq!(a.task_id, b.task_id, "shared correlation key must be one task");
+    assert!(a.is_real_boundary(), "langchain carries a real key");
+
+    let task = repo
+        .fetch_task(&a.task_id)
+        .await
+        .expect("fetch")
+        .expect("task must exist");
+
+    let hashes: Vec<&str> = task["sample_hashes"]
+        .as_array()
+        .expect("sample_hashes array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(hashes.len(), 2, "both samples must be recorded, got {hashes:?}");
+    assert!(hashes.contains(&"hash-task-a"));
+    assert!(hashes.contains(&"hash-task-b"));
+
+    // Two samples, two distinct sample-scoped traces, both retained.
+    assert_eq!(
+        task["trace_ids"].as_array().expect("trace_ids").len(),
+        2,
+        "trace_id stays sample-scoped, so a two-sample task has two traces",
+    );
+    // One target, added twice — $addToSet must not duplicate it.
+    assert_eq!(task["target_ids"].as_array().expect("target_ids").len(), 1);
+
+    assert!(task["entity_count"].as_i64().unwrap_or(0) > 0);
+    assert_eq!(task["task_id_source"].as_str(), Some("run_id"));
+    assert!(task["correlation_key"].as_str().is_some());
+}
+
+/// Re-processing a sample must not inflate the task's counters.
+///
+/// `$addToSet` is idempotent but `$inc` is not, which is why the service checks
+/// membership first. This pins that guard.
+#[tokio::test]
+async fn test_reprocessing_a_sample_does_not_double_count() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let first = fold_into_task(&repo, "hash-dup", "tgt-dup", "langchain_json.log").await;
+    let after_first = repo.fetch_task(&first.task_id).await.unwrap().unwrap();
+    let entities_after_first = after_first["entity_count"].as_i64().unwrap();
+
+    // Same sample again — the exact case a re-run or a backfill produces.
+    fold_into_task(&repo, "hash-dup", "tgt-dup", "langchain_json.log").await;
+    let after_second = repo.fetch_task(&first.task_id).await.unwrap().unwrap();
+
+    assert_eq!(
+        after_second["entity_count"].as_i64().unwrap(),
+        entities_after_first,
+        "re-processing must not advance the counters",
+    );
+    assert_eq!(
+        after_second["sample_hashes"].as_array().unwrap().len(),
+        1,
+        "the sample must appear once, not twice",
+    );
+}
+
+/// Samples with no correlation key must stay in separate tasks, and be labelled
+/// as fallbacks so an audit can tell.
+#[tokio::test]
+async fn test_samples_without_a_key_do_not_merge() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    // Raw JSON-RPC has no session concept at all.
+    let a = fold_into_task(&repo, "hash-mcp-a", "tgt-mcp", "mcp_session.log").await;
+    let b = fold_into_task(&repo, "hash-mcp-b", "tgt-mcp", "mcp_session.log").await;
+
+    assert_ne!(a.task_id, b.task_id, "no key means no merging");
+    assert!(!a.is_real_boundary());
+    assert_eq!(a.source, "sample");
+
+    // Both exist as separate one-sample tasks.
+    for correlation in [&a, &b] {
+        let task = repo.fetch_task(&correlation.task_id).await.unwrap().unwrap();
+        assert_eq!(task["sample_hashes"].as_array().unwrap().len(), 1);
+        assert_eq!(task["task_id_source"].as_str(), Some("sample"));
+        assert!(task["correlation_key"].is_null(), "no key to record");
+    }
+}
+
+/// `real_boundaries_only` must exclude sample-fallback tasks, since those are not
+/// task boundaries in any meaningful sense.
+#[tokio::test]
+async fn test_fetch_tasks_page_can_exclude_fallbacks() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let real = fold_into_task(&repo, "hash-mix-a", "tgt-mix", "langchain_json.log").await;
+    let fallback = fold_into_task(&repo, "hash-mix-b", "tgt-mix", "mcp_session.log").await;
+
+    let (all, all_total) = repo.fetch_tasks_page(None, false, 50, 0).await.unwrap();
+    assert_eq!(all_total, 2, "both tasks are listed by default");
+    assert_eq!(all.len(), 2);
+
+    let (only_real, real_total) = repo.fetch_tasks_page(None, true, 50, 0).await.unwrap();
+    assert_eq!(real_total, 1, "the fallback must be filtered out");
+    assert_eq!(only_real[0]["task_id"].as_str(), Some(real.task_id.as_str()));
+
+    // And scoping by target still works.
+    let (scoped, _) = repo
+        .fetch_tasks_page(Some("tgt-mix"), false, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 2);
+    let (none, _) = repo
+        .fetch_tasks_page(Some("tgt-nope"), false, 50, 0)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+
+    // Silence the unused warning while keeping the binding meaningful.
+    assert!(!fallback.is_real_boundary());
 }
 
 // ─── Similarity search ────────────────────────────────────────────────────────

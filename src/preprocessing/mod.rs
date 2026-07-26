@@ -39,11 +39,12 @@ pub mod relation_extractor;
 pub mod schema_extractor;
 pub mod semantic_classifier;
 pub mod stats;
+pub mod task_correlator;
 
 use mongodb::bson::DateTime;
 
 use crate::config::PreprocessingConfig;
-use crate::models::{ClassificationStatus, SampleMetadata};
+use crate::models::{ClassificationStatus, LogType, SampleMetadata};
 use crate::preprocessing::otel_builder::OtelSpan;
 use crate::preprocessing::prov_linker::ProvTriple;
 
@@ -58,6 +59,10 @@ pub struct PipelineOutput {
     pub metadata:     SampleMetadata,
     pub prov_triples: Vec<ProvTriple>,
     pub otel_spans:   Vec<OtelSpan>,
+    /// Task this sample was correlated into (Stage 11), or `None` when task
+    /// correlation is disabled. Carried out separately from `metadata` because the
+    /// `tasks` collection is upserted by the caller, not written inline.
+    pub task_correlation: Option<task_correlator::TaskCorrelation>,
 }
 
 /// Current pipeline version — increment this when the output schema or logic
@@ -160,6 +165,27 @@ impl Preprocessor {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
 
+        // ── Stage 11: task correlation ────────────────────────────────────────
+        // Scans the whole sample for a correlation key rather than reading the
+        // extracted entities, because keys routinely sit on lines that never become
+        // entities — crewai's `task_id` is on `msg="Task assigned"` lines, which
+        // match no entity pattern. See `task_correlator::correlate`.
+        //
+        // Independent of `entity_extraction_enabled` for the same reason: a sample
+        // still belongs to a task even when no entities were extracted from it.
+        //
+        // Additive: this stamps `task_id` onto entities and touches nothing else,
+        // so `trace_id`, span ids, entity ids and relation ids keep their values.
+        let mut entities = entities;
+        let task_correlation = if self.config.task_correlation_enabled {
+            let correlation =
+                task_correlator::correlate(content, format.log_type == LogType::Json, sample_hash);
+            task_correlator::apply(&mut entities, &correlation);
+            Some(correlation)
+        } else {
+            None
+        };
+
         let entity_count = entities.len() as u32;
         let relation_count = relations.len() as u32;
 
@@ -179,9 +205,17 @@ impl Preprocessor {
             relations,
             entity_count,
             relation_count,
+            task_id: task_correlation
+                .as_ref()
+                .map(|c| c.task_id.clone())
+                .unwrap_or_default(),
+            task_id_source: task_correlation
+                .as_ref()
+                .map(|c| c.source.clone())
+                .unwrap_or_default(),
         };
 
-        PipelineOutput { metadata, prov_triples, otel_spans }
+        PipelineOutput { metadata, prov_triples, otel_spans, task_correlation }
     }
 }
 
@@ -198,6 +232,7 @@ mod tests {
             metrics_port: 9090,
             entity_extraction_enabled: true,
             min_entities_for_persist: 1,
+            task_correlation_enabled: true,
         }
     }
 
@@ -300,6 +335,7 @@ mod tests {
             metrics_port: 9090,
             entity_extraction_enabled: true,
             min_entities_for_persist: 1,
+            task_correlation_enabled: true,
         };
         let preprocessor = Preprocessor::new(config);
         let meta = preprocessor
@@ -403,6 +439,145 @@ mod tests {
                 "the bedrock fixture has an `ERROR ... ThrottlingException` line",
             );
         }
+    }
+
+    // ── Stage 11: task correlation against real fixtures ─────────────────────
+    //
+    // The unit tests in `task_correlator` build field maps by hand. These run whole
+    // fixtures through the pipeline, so a mismatch between what the correlator
+    // expects and what the extractor actually produces shows up as a failure
+    // rather than as everything silently falling back to sample scope.
+
+    #[test]
+    fn langchain_fixture_correlates_on_a_real_key() {
+        let content = fixture("langchain_json.log");
+        let out = Preprocessor::new(default_config()).run("h-lc", "t", &content);
+
+        assert!(
+            !out.metadata.task_id.is_empty(),
+            "task_id must be populated when correlation is enabled",
+        );
+        assert_ne!(
+            out.metadata.task_id_source, "sample",
+            "langchain carries session_id/run_id, so this must not be a fallback",
+        );
+        // run_id outranks session_id — both are present in this fixture.
+        assert_eq!(out.metadata.task_id_source, "run_id");
+
+        let correlation = out.task_correlation.expect("correlation must be returned");
+        assert!(correlation.is_real_boundary());
+        assert!(correlation.correlation_key.is_some());
+        assert!(
+            out.metadata.entities.iter().all(|e| e.task_id == correlation.task_id),
+            "every entity must be stamped with the task id",
+        );
+    }
+
+    #[test]
+    fn crewai_fixture_correlates_on_its_own_task_id() {
+        let content = fixture("crewai_logfmt.log");
+        let out = Preprocessor::new(default_config()).run("h-crew", "t", &content);
+        // The fixture has both crew_id and task_id; task_id wins.
+        assert_eq!(out.metadata.task_id_source, "task_id");
+        assert!(out.task_correlation.unwrap().is_real_boundary());
+    }
+
+    #[test]
+    fn mcp_fixture_falls_back_cleanly() {
+        // Raw JSON-RPC has no session concept at all. The fallback must be clean
+        // and clearly labelled, not an empty or bogus task id.
+        let content = fixture("mcp_session.log");
+        let out = Preprocessor::new(default_config()).run("h-mcp", "t", &content);
+
+        assert_eq!(out.metadata.task_id_source, "sample");
+        assert_eq!(out.metadata.task_id.len(), 32);
+        let correlation = out.task_correlation.expect("a fallback is still a correlation");
+        assert!(!correlation.is_real_boundary());
+        assert_eq!(correlation.correlation_key, None);
+    }
+
+    #[test]
+    fn the_same_correlation_key_groups_two_samples() {
+        // The property the whole phase exists for: two different samples of the
+        // same session must land in one task.
+        let content = fixture("langchain_json.log");
+        let pre = Preprocessor::new(default_config());
+        let a = pre.run("hash-one", "t", &content);
+        let b = pre.run("hash-two", "t", &content);
+
+        assert_ne!(a.metadata.sample_hash, b.metadata.sample_hash);
+        assert_eq!(
+            a.metadata.task_id, b.metadata.task_id,
+            "same session across two samples must be one task",
+        );
+        // And the sample-scoped ids must still differ, proving nothing else moved.
+        assert_ne!(a.metadata.otel_trace_id, b.metadata.otel_trace_id);
+    }
+
+    #[test]
+    fn different_samples_without_keys_stay_separate() {
+        let content = fixture("mcp_session.log");
+        let pre = Preprocessor::new(default_config());
+        let a = pre.run("hash-one", "t", &content);
+        let b = pre.run("hash-two", "t", &content);
+        assert_ne!(
+            a.metadata.task_id, b.metadata.task_id,
+            "with no correlation key, each sample is its own task",
+        );
+    }
+
+    #[test]
+    fn task_correlation_disabled_leaves_everything_empty() {
+        let mut config = default_config();
+        config.task_correlation_enabled = false;
+        let content = fixture("langchain_json.log");
+        let out = Preprocessor::new(config).run("h", "t", &content);
+
+        assert!(out.metadata.task_id.is_empty());
+        assert!(out.metadata.task_id_source.is_empty());
+        assert!(out.task_correlation.is_none());
+        assert!(out.metadata.entities.iter().all(|e| e.task_id.is_empty()));
+    }
+
+    #[test]
+    fn task_correlation_does_not_disturb_the_existing_ids() {
+        // The safety property behind the whole design: adding task_id must not
+        // change trace_id, span ids, entity ids or relation ids, because
+        // otel_spans and PART_OF edges are keyed on them.
+        let content = fixture("langchain_json.log");
+        let mut off = default_config();
+        off.task_correlation_enabled = false;
+        let without = Preprocessor::new(off).run("h-same", "t", &content);
+        let with = Preprocessor::new(default_config()).run("h-same", "t", &content);
+
+        assert_eq!(without.metadata.otel_trace_id, with.metadata.otel_trace_id);
+        assert_eq!(
+            without.metadata.entities.iter().map(|e| &e.entity_id).collect::<Vec<_>>(),
+            with.metadata.entities.iter().map(|e| &e.entity_id).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            without.metadata.entities.iter().map(|e| &e.span_id).collect::<Vec<_>>(),
+            with.metadata.entities.iter().map(|e| &e.span_id).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            without.metadata.relations.iter().map(|r| &r.relation_id).collect::<Vec<_>>(),
+            with.metadata.relations.iter().map(|r| &r.relation_id).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            without.otel_spans.iter().map(|s| (&s.trace_id, &s.span_id)).collect::<Vec<_>>(),
+            with.otel_spans.iter().map(|s| (&s.trace_id, &s.span_id)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn nginx_fixture_yields_a_fallback_task_without_entities() {
+        // Zero entities, so nothing to correlate on — must not panic, and must
+        // still produce a usable fallback id.
+        let content = fixture("nginx_access.log");
+        let out = Preprocessor::new(default_config()).run("h-nginx", "t", &content);
+        assert!(out.metadata.entities.is_empty());
+        assert_eq!(out.metadata.task_id_source, "sample");
+        assert_eq!(out.metadata.task_id.len(), 32);
     }
 
     #[test]

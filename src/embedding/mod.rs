@@ -290,6 +290,8 @@ mod tests {
             timestamp_utc: None,
             content_embedding_id: None,
             behavioral_embedding_id: None,
+            task_id: String::new(),
+            correlation_key: None,
         }
     }
 

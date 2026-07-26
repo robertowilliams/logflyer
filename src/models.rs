@@ -585,6 +585,20 @@ pub struct EntityRecord {
     pub content_embedding_id: Option<String>,
     /// FK to the behavioral embedding record — populated asynchronously.
     pub behavioral_embedding_id: Option<String>,
+    /// Task this entity belongs to (Stage 11).
+    ///
+    /// Unlike every other id here, this one is **not** scoped to the sample: two
+    /// samples carrying the same `session_id` share a `task_id`, which is how a
+    /// task spanning several samples reassembles. Empty on documents written
+    /// before Stage 11, and when `TASK_CORRELATION_ENABLED=false`.
+    ///
+    /// See [`crate::preprocessing::task_correlator`].
+    #[serde(default)]
+    pub task_id: String,
+    /// The raw correlation value `task_id` was derived from, for display.
+    /// `None` when the task fell back to sample scope.
+    #[serde(default)]
+    pub correlation_key: Option<String>,
 }
 
 /// A directed relationship between two [`EntityRecord`] instances.
@@ -607,6 +621,54 @@ pub struct RelationEdge {
     pub confidence: f32,
     pub source: RelationSource,
     pub created_at: DateTime,
+}
+
+// ─── TaskRecord ───────────────────────────────────────────────────────────────
+
+/// One task — the index of the task-scoped semantic database.
+///
+/// Stored in the `tasks` collection, keyed on `task_id`. Accumulates rather than
+/// being replaced: each sample that belongs to a task `$addToSet`s itself into
+/// `sample_hashes` and `trace_ids`, so a task spanning several log samples is
+/// stitched together as they arrive, in any order.
+///
+/// This is what makes "find similar tasks, then open their graph" possible:
+/// `sample_hashes` is the join key back to `sample_metadata`, `entity_edges` and
+/// `otel_spans` for the full interaction graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    /// Stable 32-hex-char id, shared by every sample in this task.
+    pub task_id: String,
+    /// Which field the id was derived from — `session_id`, `run_id`, … or
+    /// `sample` for a fallback boundary.
+    pub task_id_source: String,
+    /// The raw correlation value, for display. `None` for a sample fallback.
+    #[serde(default)]
+    pub correlation_key: Option<String>,
+    /// Every sample observed as part of this task. The join key to the graph.
+    #[serde(default)]
+    pub sample_hashes: Vec<String>,
+    /// Every OTel trace making up this task — one per sample, since `trace_id`
+    /// remains sample-scoped by design.
+    #[serde(default)]
+    pub trace_ids: Vec<String>,
+    /// Sampling targets this task's data came from. More than one means the task
+    /// was observed across several sources.
+    #[serde(default)]
+    pub target_ids: Vec<String>,
+    /// Running totals across all the task's samples.
+    #[serde(default)]
+    pub entity_count: u32,
+    #[serde(default)]
+    pub relation_count: u32,
+    /// When this task was first and most recently seen. `last_seen` advances as
+    /// further samples arrive; `first_seen` is set once on insert.
+    pub first_seen: DateTime,
+    pub last_seen: DateTime,
+    /// The task's goal statement, for semantic search. Populated by Phase 3 —
+    /// always `None` today.
+    #[serde(default)]
+    pub intent_text: Option<String>,
 }
 
 // ─── SampleMetadata ───────────────────────────────────────────────────────────
@@ -650,6 +712,21 @@ pub struct SampleMetadata {
     pub entity_count: u32,
     #[serde(default)]
     pub relation_count: u32,
+    /// Task this sample belongs to (Stage 11).
+    ///
+    /// Shared with any other sample carrying the same correlation key, so this is
+    /// the join key for "the whole graph for this task". Empty on pre-Stage-11
+    /// documents and when `TASK_CORRELATION_ENABLED=false`.
+    #[serde(default)]
+    pub task_id: String,
+    /// Which field `task_id` came from — `session_id`, `run_id`, … or `sample`
+    /// when the log carried no correlation key.
+    ///
+    /// Recorded so an audit does not overstate its own confidence: a boundary
+    /// derived from `session_id` is meaningful; one derived from the sample hash
+    /// only means "we could not tell".
+    #[serde(default)]
+    pub task_id_source: String,
 }
 
 impl SampleMetadata {

@@ -65,6 +65,24 @@ pub fn derive_span_id(sample_hash: &str, line_index: u32) -> String {
     truncate(sha256_hex(&[sample_hash, "span", &line_index.to_string()]), 16)
 }
 
+/// 32-hex-char task ID derived from a correlation key.
+///
+/// **Deliberately not keyed on `sample_hash`.** This is the one id in the module
+/// that is meant to be *shared* across samples: two samples carrying the same
+/// `session_id` must produce the same task id, which is how a task spanning
+/// several log samples gets stitched back together.
+///
+/// `key_name` is part of the hash so that `session_id=abc` and `run_id=abc`
+/// cannot collide — different correlation dimensions that happen to share a value
+/// are different tasks.
+///
+/// When a log carries no correlation key at all, the caller passes
+/// `("sample", sample_hash)`, which reproduces today's one-task-per-sample
+/// behaviour rather than merging unrelated work.
+pub fn derive_task_id(key_name: &str, key_value: &str) -> String {
+    truncate(sha256_hex(&[key_name, "task", key_value]), 32)
+}
+
 /// 32-hex-char opaque entity ID derived from the sample's stable identity
 /// plus the line that produced this entity.  `raw_text` is included so two
 /// entities extracted from the same line by different rules can still get
@@ -126,6 +144,60 @@ mod tests {
         assert_eq!(derive_span_id("abc", 0), derive_span_id("abc", 0));
         assert_ne!(derive_span_id("abc", 0), derive_span_id("abc", 1));
         assert_eq!(derive_span_id("abc", 0).len(), 16);
+    }
+
+    #[test]
+    fn derive_task_id_is_deterministic() {
+        assert_eq!(
+            derive_task_id("session_id", "sess-abc"),
+            derive_task_id("session_id", "sess-abc"),
+        );
+        assert_eq!(derive_task_id("session_id", "sess-abc").len(), 32);
+    }
+
+    #[test]
+    fn derive_task_id_is_independent_of_the_sample() {
+        // The defining property: the same correlation key must yield the same task
+        // id no matter which sample it was seen in. This is what lets a task span
+        // several samples.
+        let from_one_sample = derive_task_id("session_id", "sess-abc");
+        let from_another = derive_task_id("session_id", "sess-abc");
+        assert_eq!(from_one_sample, from_another);
+    }
+
+    #[test]
+    fn derive_task_id_separates_key_dimensions() {
+        // `session_id=abc` and `run_id=abc` are different tasks that happen to
+        // share a value; they must not collide.
+        assert_ne!(
+            derive_task_id("session_id", "abc"),
+            derive_task_id("run_id", "abc"),
+        );
+    }
+
+    #[test]
+    fn derive_task_id_distinguishes_values() {
+        assert_ne!(
+            derive_task_id("session_id", "sess-a"),
+            derive_task_id("session_id", "sess-b"),
+        );
+    }
+
+    #[test]
+    fn derive_task_id_sample_fallback_is_per_sample() {
+        // With no correlation key, each sample is its own task — today's behaviour.
+        assert_ne!(
+            derive_task_id("sample", "hash-a"),
+            derive_task_id("sample", "hash-b"),
+        );
+    }
+
+    #[test]
+    fn derive_task_id_does_not_collide_with_the_trace_id() {
+        // Both are 32 hex chars over the same input in the fallback case, so the
+        // domain separator has to keep them apart — otherwise a task id and a
+        // trace id could be confused for one another.
+        assert_ne!(derive_task_id("sample", "abc"), derive_trace_id("abc"));
     }
 
     #[test]

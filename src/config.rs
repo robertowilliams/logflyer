@@ -36,6 +36,13 @@ pub struct PreprocessingConfig {
     /// than this many entities are extracted from a sample.  Setting to 0
     /// disables the gate and writes for every sample with ≥1 entity.
     pub min_entities_for_persist: usize,
+    /// Switch for stage 11 (task correlation).  When `false`, `task_id` and
+    /// `task_id_source` stay empty and nothing is written to the `tasks`
+    /// collection — exactly the behaviour before stage 11 existed.
+    ///
+    /// Off by default: task correlation changes nothing about existing fields,
+    /// but it does start writing a new collection, and that should be opted into.
+    pub task_correlation_enabled: bool,
 }
 
 /// Configuration for the Phase 6 output adapters.
@@ -189,6 +196,7 @@ impl AppConfig {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(1),
+                task_correlation_enabled: bool_flag("TASK_CORRELATION_ENABLED", false),
             },
         })
     }

@@ -5,7 +5,7 @@ use mongodb::bson::{self, doc, Bson, DateTime, Document};
 use mongodb::error::Error as MongoError;
 use mongodb::options::{
     ClientOptions, FindOneAndReplaceOptions, FindOneOptions, FindOptions, IndexOptions,
-    ReplaceOptions,
+    ReplaceOptions, UpdateOptions,
 };
 use mongodb::{Client, Collection, Database, IndexModel};
 use serde::Serialize;
@@ -22,8 +22,12 @@ use crate::config::{ConfigHistoryConfig, MongoConfig};
 use crate::config_history;
 use crate::embedding::EmbeddingKind;
 use crate::error::AppError;
+use crate::preprocessing::task_correlator::SAMPLE_FALLBACK;
 use crate::output::vector::{BEHAVIORAL_EMBEDDINGS_COLL, CONTENT_EMBEDDINGS_COLL};
 use crate::models::{ClassificationRecord, ClassificationStatus, SampleMetadata, SampleRecord};
+
+/// The task index collection (Stage 11).
+pub const TASKS_COLL: &str = "tasks";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {
@@ -1560,6 +1564,183 @@ impl MongoRepository {
             node_ids,
             truncated: reachable.truncated,
         }))
+    }
+
+    // ─── Tasks (Stage 11) ─────────────────────────────────────────────────────
+
+    /// Upsert a task, accumulating rather than replacing.
+    ///
+    /// A task can span several samples, and those samples arrive independently and
+    /// in any order — so this **must not** be a `replace_one`. `$addToSet` unions
+    /// the sample hashes, trace ids and target ids; `$inc` accumulates the counts;
+    /// `$min` / `$max` widen the observed time window; and `$setOnInsert` fixes the
+    /// immutable identity fields on first write only.
+    ///
+    /// Idempotent: re-processing the same sample adds nothing to the sets, and the
+    /// counts are `$inc`'d by the *delta* the caller computes rather than blindly,
+    /// so a re-run does not inflate them. See [`Self::task_sample_counted`].
+    pub async fn upsert_task(
+        &self,
+        task_id: &str,
+        task_id_source: &str,
+        correlation_key: Option<&str>,
+        sample_hash: &str,
+        trace_id: &str,
+        target_id: &str,
+        entity_delta: u32,
+        relation_delta: u32,
+    ) -> Result<(), AppError> {
+        self.ensure_task_indexes().await;
+
+        let col = self.destination_database.collection::<Document>(TASKS_COLL);
+        let now = DateTime::now();
+
+        let mut set_on_insert = doc! {
+            "task_id":        task_id,
+            "task_id_source": task_id_source,
+            "first_seen":     now,
+        };
+        if let Some(key) = correlation_key {
+            set_on_insert.insert("correlation_key", key);
+        }
+
+        let update = doc! {
+            "$setOnInsert": set_on_insert,
+            "$addToSet": {
+                "sample_hashes": sample_hash,
+                "trace_ids":     trace_id,
+                "target_ids":    target_id,
+            },
+            "$inc": {
+                "entity_count":   entity_delta as i64,
+                "relation_count": relation_delta as i64,
+            },
+            "$max": { "last_seen": now },
+        };
+
+        col.update_one(
+            doc! { "task_id": task_id },
+            update,
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Whether a sample has already been counted into its task.
+    ///
+    /// Callers check this before [`Self::upsert_task`] so the `$inc` counters are
+    /// only advanced the first time a given sample joins a task. Without it,
+    /// re-processing a sample would double-count its entities and relations —
+    /// `$addToSet` is idempotent but `$inc` is not.
+    pub async fn task_sample_counted(
+        &self,
+        task_id: &str,
+        sample_hash: &str,
+    ) -> Result<bool, AppError> {
+        let col = self.destination_database.collection::<Document>(TASKS_COLL);
+        let found = col
+            .find_one(
+                doc! { "task_id": task_id, "sample_hashes": sample_hash },
+                FindOneOptions::builder().projection(doc! { "_id": 1 }).build(),
+            )
+            .await?;
+        Ok(found.is_some())
+    }
+
+    /// Fetch one task by id.
+    pub async fn fetch_task(&self, task_id: &str) -> Result<Option<JsonValue>, AppError> {
+        let col = self.destination_database.collection::<Document>(TASKS_COLL);
+        Ok(col
+            .find_one(doc! { "task_id": task_id }, None)
+            .await?
+            .map(bson_doc_to_json))
+    }
+
+    /// Page through tasks, newest activity first.
+    ///
+    /// `real_boundaries_only` excludes tasks whose id came from the sample
+    /// fallback — useful because those are not task boundaries in any meaningful
+    /// sense, just one-sample-per-task placeholders for logs with no correlation
+    /// key.
+    pub async fn fetch_tasks_page(
+        &self,
+        target_id: Option<&str>,
+        real_boundaries_only: bool,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self.destination_database.collection::<Document>(TASKS_COLL);
+
+        let mut filter = Document::new();
+        if let Some(tid) = target_id {
+            filter.insert("target_ids", tid);
+        }
+        if real_boundaries_only {
+            filter.insert("task_id_source", doc! { "$ne": SAMPLE_FALLBACK });
+        }
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let opts = FindOptions::builder()
+            .sort(doc! { "last_seen": -1 })
+            .skip(page * limit as u64)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
+    }
+
+    /// Indexes for the `tasks` collection.
+    ///
+    /// Best-effort like [`Self::ensure_entity_id_index`], since tasks are read on
+    /// API paths where a read-only Mongo user should still be able to query.
+    async fn ensure_task_indexes(&self) {
+        const MARKER: &str = "tasks::indexes";
+        {
+            let guard = self.indexed_collections.lock().await;
+            if guard.contains(MARKER) {
+                return;
+            }
+        }
+
+        let col = self.destination_database.collection::<Document>(TASKS_COLL);
+        let models = vec![
+            IndexModel::builder()
+                .keys(doc! { "task_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name(Some("tasks_unique_task_id".to_string()))
+                        .unique(Some(true))
+                        .build(),
+                )
+                .build(),
+            // The join key back to the graph: "which task does this sample belong to".
+            IndexModel::builder()
+                .keys(doc! { "sample_hashes": 1 })
+                .options(IndexOptions::builder().name(Some("tasks_sample_hashes".to_string())).build())
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "last_seen": -1 })
+                .options(IndexOptions::builder().name(Some("tasks_last_seen".to_string())).build())
+                .build(),
+        ];
+
+        for model in models {
+            if let Err(e) = col.create_index(model, None).await {
+                warn!(error = %e, "could not create a tasks index; queries will scan");
+            }
+        }
+
+        self.indexed_collections
+            .lock()
+            .await
+            .insert(MARKER.to_string());
     }
 
     // ─── Similarity search ────────────────────────────────────────────────────

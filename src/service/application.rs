@@ -476,6 +476,7 @@ async fn run_preprocessing(
     let metadata = pipeline_output.metadata;
     let prov_triples = pipeline_output.prov_triples;
     let otel_spans = pipeline_output.otel_spans;
+    let task_correlation = pipeline_output.task_correlation;
 
     let worth = metadata.ingestion_hints.worth_classifying;
     let score = metadata.agentic_scan.signal_score;
@@ -497,6 +498,14 @@ async fn run_preprocessing(
                 elapsed_ms = (elapsed_secs * 1000.0) as u64,
                 "stored preprocessing metadata"
             );
+
+            // Stage 11: fold this sample into its task. Independent of the
+            // min_entities gate below — a task should register even when the
+            // sample was too sparse to warrant graph/vector writes, or the task's
+            // sample list would have holes in it.
+            if let Some(ref correlation) = task_correlation {
+                upsert_task_for_sample(repository, &metadata, correlation).await;
+            }
 
             // Skip the async output adapters when the sample produced fewer
             // entities than the configured threshold — saves DB round-trips
@@ -625,6 +634,65 @@ fn build_async_outputs(
 /// via the optional [`GraphWriter`].
 ///
 /// Each write is independent: a failure on one is logged and processing
+/// Fold one sample into its task's `tasks` document (Stage 11).
+///
+/// Checks whether the sample has already been counted before upserting, because
+/// `$addToSet` is idempotent but `$inc` is not — re-processing a sample would
+/// otherwise keep inflating the task's entity and relation totals.
+///
+/// Errors are logged and swallowed. A task index that is briefly behind is far
+/// preferable to a failed sampling cycle, and the next run of the same sample
+/// repairs it.
+async fn upsert_task_for_sample(
+    repository: &MongoRepository,
+    metadata: &crate::models::SampleMetadata,
+    correlation: &crate::preprocessing::task_correlator::TaskCorrelation,
+) {
+    let already_counted = match repository
+        .task_sample_counted(&correlation.task_id, &metadata.sample_hash)
+        .await
+    {
+        Ok(counted) => counted,
+        Err(error) => {
+            warn!(error = ?error, task_id = %correlation.task_id, "could not check task membership; skipping task upsert");
+            return;
+        }
+    };
+
+    // Re-run of a sample we have already folded in: refresh the sets and
+    // last_seen, but do not advance the counters again.
+    let (entity_delta, relation_delta) = if already_counted {
+        (0, 0)
+    } else {
+        (metadata.entity_count, metadata.relation_count)
+    };
+
+    if let Err(error) = repository
+        .upsert_task(
+            &correlation.task_id,
+            &correlation.source,
+            correlation.correlation_key.as_deref(),
+            &metadata.sample_hash,
+            &metadata.otel_trace_id,
+            &metadata.target_id,
+            entity_delta,
+            relation_delta,
+        )
+        .await
+    {
+        warn!(error = ?error, task_id = %correlation.task_id, "failed to upsert task");
+        return;
+    }
+
+    info!(
+        task_id = %correlation.task_id,
+        task_id_source = %correlation.source,
+        sample_hash = %metadata.sample_hash,
+        new_to_task = !already_counted,
+        "folded sample into task"
+    );
+}
+
 /// continues with the next.  All errors are non-fatal.
 async fn persist_lineage(
     outputs: &AsyncOutputs,
