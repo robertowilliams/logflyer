@@ -204,6 +204,10 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
   const expansion      = ref<GraphTraversal | null>(null)
   const expanding      = ref(false)
   const expansionError = ref<string | null>(null)
+  /** What produced the current overlay. A resolved path reuses the same
+   *  rendering path as a traversal, but describing it as a "downstream
+   *  traversal" in the banner would be wrong, so track which it is. */
+  const expansionKind  = ref<'traversal' | 'path'>('traversal')
 
   /** Edges the graph should draw: the active traversal if there is one,
    *  otherwise the selected sample's own relations.
@@ -242,6 +246,7 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
       const res = await client.getGraphPath(from, to, maxDepth)
       if (res.found) {
         // Reuse the expansion overlay so the path renders in the same graph.
+        expansionKind.value = 'path'
         expansion.value = {
           root:          res.from,
           direction:     'downstream',
@@ -256,9 +261,13 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
       } else if (res.truncated) {
         // The search hit a budget, so "no path" is not a safe conclusion.
         expansionError.value =
-          'Search was truncated before finishing — the entities may still be connected. Try a smaller depth.'
+          'The search hit its size limit before finishing, so these entities may still be connected. ' +
+          'Narrowing the relation-type filter will shrink the graph it has to walk.'
       } else {
-        expansionError.value = 'No path found between those entities.'
+        // Edges are directed and the search only follows them outward, so the
+        // reverse pick is a genuinely different question — and a common mistake.
+        expansionError.value =
+          'No path found. Relations are directed, so try picking them the other way round.'
       }
       return res
     } catch (e: any) {
@@ -273,6 +282,7 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     try {
       expanding.value = true; expansionError.value = null
       expansion.value = await fetcher()
+      expansionKind.value = 'traversal'
     } catch (e: any) {
       // Leave any previous expansion in place — a failed expand should not
       // blank out a graph the user is already looking at.
@@ -286,6 +296,7 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
   function clearExpansion() {
     expansion.value = null
     expansionError.value = null
+    expansionKind.value = 'traversal'
   }
 
   /** Resolve a single entity that is not in the loaded sample.
@@ -357,7 +368,7 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     filteredEntities, filteredRelations,
     entityTypeCounts, relationTypeCounts,
     // graph traversal
-    expansion, expanding, expansionError,
+    expansion, expanding, expansionError, expansionKind,
     graphRelations, graphEntities,
     expandDownstream, expandUpstream, findPath, clearExpansion, resolveEntity,
     // actions

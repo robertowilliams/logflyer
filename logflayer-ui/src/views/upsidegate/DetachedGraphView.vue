@@ -9,7 +9,7 @@ import { computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useUpsidegateStore } from '../../stores/upsidegate'
 import type { RelationType } from '../../types'
-import { Waypoints, X } from 'lucide-vue-next'
+import { Waypoints, X, Route } from 'lucide-vue-next'
 import RelationGraph from '../../components/RelationGraph.vue'
 import circlesLogoUrl from '../../assets/circles-logo.svg'
 
@@ -36,6 +36,8 @@ const entityCount = computed(() => {
 
 /** Hops requested when expanding a node from this window. */
 const traversalDepth = 2
+/** Hops to search when resolving a path — see RelationsView for the rationale. */
+const pathMaxDepth = 6
 
 onMounted(async () => {
   if (hash.value) await ugStore.fetchMetadataByHash(hash.value)
@@ -52,14 +54,32 @@ onMounted(async () => {
         <div class="text-[10px] text-[rgba(245,245,220,0.40)] font-mono truncate">{{ hash }}</div>
       </div>
       <div class="ml-auto flex items-center gap-3">
+        <!-- Path lookups can fail (unreachable pair, truncated search); without
+             this the message would only ever appear in the main window. -->
+        <span
+          v-if="ugStore.expansionError"
+          class="inline-flex items-center gap-1.5 px-2 py-1 rounded text-[11px] border
+                 border-[#f59e0b]/50 bg-[#f59e0b]/10 text-[#f59e0b] max-w-md"
+        >
+          <span class="truncate">{{ ugStore.expansionError }}</span>
+          <button class="opacity-70 hover:opacity-100 shrink-0" @click="ugStore.clearExpansion()">
+            <X :size="12" />
+          </button>
+        </span>
         <button
           v-if="ugStore.expansion"
           class="inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] border
                  border-[#00d4ff]/40 bg-[#00d4ff]/10 text-[#00d4ff] hover:bg-[#00d4ff]/20 transition-colors"
-          :title="`Showing ${ugStore.expansion.direction} traversal — click to return to the sample`"
+          title="Click to return to the sample-scoped graph"
           @click="ugStore.clearExpansion()"
         >
-          <Waypoints :size="12" />{{ ugStore.expansion.direction }} · depth {{ ugStore.expansion.depth_reached }}
+          <component :is="ugStore.expansionKind === 'path' ? Route : Waypoints" :size="12" />
+          <template v-if="ugStore.expansionKind === 'path'">
+            path · {{ ugStore.expansion.depth_reached }} hops
+          </template>
+          <template v-else>
+            {{ ugStore.expansion.direction }} · depth {{ ugStore.expansion.depth_reached }}
+          </template>
           <X :size="12" />
         </button>
         <span v-if="ugStore.selected" class="text-xs text-[rgba(245,245,220,0.45)]">
@@ -100,6 +120,7 @@ onMounted(async () => {
         expanded
         @traverse-downstream="id => ugStore.expandDownstream(id, traversalDepth)"
         @traverse-upstream="id => ugStore.expandUpstream(id, traversalDepth)"
+        @find-path="(from, to) => ugStore.findPath(from, to, pathMaxDepth)"
       />
     </main>
   </div>

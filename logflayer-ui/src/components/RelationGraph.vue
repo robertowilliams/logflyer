@@ -9,7 +9,7 @@
 import { ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import {
   Plus, Minus, RotateCcw, Crosshair, Maximize2, ExternalLink, X, Copy, Check, CircleDot, Waypoints,
-  ArrowUpLeft, ArrowDownRight,
+  ArrowUpLeft, ArrowDownRight, Route,
 } from 'lucide-vue-next'
 import type { RelationEdge, EntityRecord } from '../types'
 
@@ -28,6 +28,8 @@ const emit = defineEmits<{
    *  The component stays presentational — it never fetches. */
   'traverse-downstream': [entityId: string]
   'traverse-upstream': [entityId: string]
+  /** Ask the parent to resolve the shortest path between two picked nodes. */
+  'find-path': [from: string, to: string]
 }>()
 
 // ── Coordinate space (SVG scales to container width via viewBox) ──────────────
@@ -118,6 +120,13 @@ function build() {
   edgeIndex.value = null
   if (detailId.value && !index.has(detailId.value)) {
     detailId.value = null
+  }
+  // Same for a half-finished path pick: if the source node is gone (the relation
+  // filter changed, or a different sample was selected), its cyan ring would
+  // vanish while the instruction strip still asked for a target — and the next
+  // click would emit a path from an invisible node.
+  if (pathFrom.value && !index.has(pathFrom.value)) {
+    pathFrom.value = null
   }
 
   reheat()
@@ -366,10 +375,52 @@ async function copyValue(text: string, key: string) {
 }
 
 function registerClick(i: number) {
-  if (clickTrack.index !== i) clickTrack = { index: i, count: 0 }
+  if (clickTrack.index !== i) {
+    // Switching to a different node ends the previous node's gesture. Resolve it
+    // now rather than discarding it: in path mode the user clicks source then
+    // target in quick succession, and dropping the first click would silently
+    // make the *target* the source.
+    if (resolveTimer) {
+      clearTimeout(resolveTimer)
+      resolveTimer = 0
+      resolveClicks()
+    }
+    clickTrack = { index: i, count: 0 }
+  }
   clickTrack.count += 1
   if (resolveTimer) clearTimeout(resolveTimer)
   resolveTimer = window.setTimeout(resolveClicks, RESOLVE_MS)
+}
+
+// ── Path picking ──────────────────────────────────────────────────────────────
+// Shortest-path lookup needs two nodes, and there is no natural gesture for
+// "these two". Rather than inventing one, path mode is an explicit toggle: while
+// it is on, a single click picks first the source then the target, and the
+// component emits. Single-click is otherwise unused on nodes — double opens the
+// detail window, triple pins — so nothing is overloaded.
+const pathMode = ref(false)
+const pathFrom = ref<string | null>(null)
+
+function togglePathMode() {
+  pathMode.value = !pathMode.value
+  pathFrom.value = null
+  // The detail window would sit on top of the nodes being picked.
+  if (pathMode.value) detailId.value = null
+}
+
+function pickPathNode(id: string) {
+  if (pathFrom.value === null) {
+    pathFrom.value = id
+    return
+  }
+  if (pathFrom.value === id) {
+    // Clicking the same node again is a deselect, not a zero-length path query.
+    pathFrom.value = null
+    return
+  }
+  emit('find-path', pathFrom.value, id)
+  pathFrom.value = null
+  pathMode.value = false
 }
 
 function resolveClicks() {
@@ -378,7 +429,12 @@ function resolveClicks() {
   resolveTimer = 0
   const nd = nodes.value[index]
   if (!nd) return
-  if (count === 2) {
+  if (pathMode.value && count <= 2) {
+    // In path mode a double-click is a fumbled pick, not a request for the
+    // detail window — opening it would cover the nodes still being picked,
+    // which is why `togglePathMode` closes it on entry.
+    pickPathNode(nd.id)
+  } else if (count === 2) {
     detailId.value = nd.id
   } else if (count >= 3) {
     nd.pinned = !nd.pinned
@@ -559,6 +615,17 @@ const detailRows = computed(() => {
           class="cursor-grab active:cursor-grabbing"
           @pointerdown="onNodePointerDown(i, $event)"
         >
+          <!-- Path-source ring: marks the node picked as the path's origin -->
+          <circle
+            v-if="pathFrom === nd.id"
+            :cx="nd.x"
+            :cy="nd.y"
+            :r="R + 6"
+            fill="none"
+            stroke="#00d4ff"
+            stroke-width="2"
+            class="pointer-events-none"
+          />
           <!-- Pin ring -->
           <circle
             v-if="nd.pinned"
@@ -641,12 +708,36 @@ const detailRows = computed(() => {
         <Maximize2 :size="14" />
       </button>
       <button
+        class="w-7 h-7 flex items-center justify-center rounded border transition-colors"
+        :class="pathMode
+          ? 'bg-[#00d4ff]/25 border-[#00d4ff] text-[#00d4ff]'
+          : 'bg-[#1a1a1a]/90 border-[#333] text-[rgba(245,245,220,0.7)] hover:text-[#00d4ff] hover:border-[#00d4ff]/50'"
+        :title="pathMode ? 'Cancel path mode' : 'Find shortest path between two nodes'"
+        @click="togglePathMode"
+      >
+        <Route :size="14" />
+      </button>
+      <button
         v-if="!expanded"
         class="w-7 h-7 flex items-center justify-center rounded bg-[#1a1a1a]/90 border border-[#333] text-[rgba(245,245,220,0.7)] hover:text-[#00d4ff] hover:border-[#00d4ff]/50 transition-colors"
         title="Detach to a separate window"
         @click="emit('detach')"
       >
         <ExternalLink :size="14" />
+      </button>
+    </div>
+
+    <!-- Path-mode instruction strip -->
+    <div
+      v-if="pathMode"
+      class="absolute top-2 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1.5 rounded-full
+             bg-[#00d4ff]/15 border border-[#00d4ff]/50 text-[11px] text-[#00d4ff] backdrop-blur-sm"
+    >
+      <Route :size="13" />
+      <span v-if="pathFrom === null">Click the <strong>source</strong> node</span>
+      <span v-else>Now click the <strong>target</strong> node</span>
+      <button class="opacity-70 hover:opacity-100" title="Cancel" @click="togglePathMode">
+        <X :size="12" />
       </button>
     </div>
 

@@ -101,8 +101,19 @@
         class="card border-[#00d4ff]/40 bg-[#00d4ff]/5 text-sm flex items-center justify-between gap-4"
       >
         <div class="flex items-center gap-2 min-w-0">
-          <Waypoints :size="16" class="text-[#00d4ff] shrink-0" />
-          <span class="text-[rgba(245,245,220,0.70)] truncate">
+          <component
+            :is="ugStore.expansionKind === 'path' ? Route : Waypoints"
+            :size="16"
+            class="text-[#00d4ff] shrink-0"
+          />
+          <span v-if="ugStore.expansionKind === 'path'" class="text-[rgba(245,245,220,0.70)] truncate">
+            Showing <span class="text-[#00d4ff]">shortest path</span> from
+            <code class="text-xs">{{ ugStore.expansion.root.slice(0, 12) }}</code>
+            — {{ ugStore.expansion.depth_reached }}
+            {{ ugStore.expansion.depth_reached === 1 ? 'hop' : 'hops' }},
+            {{ ugStore.expansion.node_count }} entities
+          </span>
+          <span v-else class="text-[rgba(245,245,220,0.70)] truncate">
             Showing
             <span class="text-[#00d4ff]">{{ ugStore.expansion.direction }}</span>
             traversal from
@@ -146,6 +157,7 @@
           @detach="openDetached"
           @traverse-downstream="id => ugStore.expandDownstream(id, traversalDepth)"
           @traverse-upstream="id => ugStore.expandUpstream(id, traversalDepth)"
+          @find-path="(from, to) => ugStore.findPath(from, to, pathMaxDepth)"
         />
       </div>
 
@@ -192,6 +204,7 @@
                   expanded
                   @traverse-downstream="id => ugStore.expandDownstream(id, traversalDepth)"
                   @traverse-upstream="id => ugStore.expandUpstream(id, traversalDepth)"
+                  @find-path="(from, to) => ugStore.findPath(from, to, pathMaxDepth)"
                 />
               </div>
             </div>
@@ -242,7 +255,7 @@ import { useRouter } from 'vue-router'
 import { useLogflayerStore } from '../../stores/logflayer'
 import { useUpsidegateStore } from '../../stores/upsidegate'
 import type { RelationType } from '../../types'
-import { X, Share2, ArrowRight, Waypoints } from 'lucide-vue-next'
+import { X, Share2, ArrowRight, Waypoints, Route } from 'lucide-vue-next'
 import RelationGraph from '../../components/RelationGraph.vue'
 
 const store   = useLogflayerStore()
@@ -263,6 +276,10 @@ const showGraphModal  = ref(false)
 /** Hops requested when expanding a node. Two is enough to show a node's
  *  neighbourhood without pulling in most of the graph. */
 const traversalDepth  = 2
+/** Hops to search when resolving a path. Deliberately larger than
+ *  `traversalDepth`: a path search is looking for a specific target and only
+ *  returns the winning chain, so a wider search costs the user nothing. */
+const pathMaxDepth    = 6
 
 const RELATION_TYPES: RelationType[] = [
   'TRIGGERED_BY', 'GENERATED', 'INFORMED', 'FOLLOWED_BY',
