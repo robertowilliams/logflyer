@@ -169,7 +169,13 @@ fn extract_level_syslog(line: &str) -> Option<String> {
     extract_level_plain(line)
 }
 
-fn extract_level_plain(line: &str) -> Option<String> {
+/// Extract a canonical severity from an unstructured line.
+///
+/// Exposed to the rest of the crate so severity classification lives in one
+/// place: [`crate::preprocessing::otel_builder`] needs the same answer when
+/// deriving OTel span status for plain-text and multiline samples, and a second
+/// copy of [`LEVEL_ALIASES`] would inevitably drift from this one.
+pub(crate) fn extract_level_plain(line: &str) -> Option<String> {
     // Scan for bracketed or bare level keywords: `[INFO]`, `ERROR:`, `WARN `, etc.
     let upper = line.to_ascii_uppercase();
     for (alias, canonical) in LEVEL_ALIASES {

@@ -129,6 +129,19 @@ pub struct McpParsed {
     pub available_prompts: Vec<String>,
 
     // ── Error fields ─────────────────────────────────────────────────────────
+    //
+    // NOTE: these three are currently computed and discarded. The only caller,
+    // `entity_extractor::extract_entities`, takes `tool_name` and `server_id`
+    // and drops the rest, because `EntityRecord` has no error field to put them
+    // in. `otel_builder::status` therefore re-derives error state from
+    // `extracted_fields`, which is lower fidelity — it sees the raw `error`
+    // object rather than this parsed form, and it accepts a bare string where
+    // `extract_error` requires an object.
+    //
+    // Reconciling the two means adding error fields to `EntityRecord` and having
+    // the extractor carry these through, at which point `status()` can prefer
+    // them for McpEvent entities. Worth doing; out of scope for the change that
+    // added `status()`.
 
     /// Set to `true` for [`McpMessageType::ErrorResponse`] messages **and** for
     /// successful tool responses where `result.isError == true`.

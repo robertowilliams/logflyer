@@ -341,4 +341,82 @@ mod tests {
         // PROV triples include at least the per-entity attribution edges.
         assert!(!out.prov_triples.is_empty(), "prov_triples should be emitted");
     }
+
+    // ── Span status against real fixtures ────────────────────────────────────
+    //
+    // `otel_builder::status` is unit-tested against hand-built field maps, but
+    // those maps are only useful if the extractor actually produces that shape.
+    // These tests run whole fixtures through the pipeline so a mismatch between
+    // `status()`'s expectations and `extracted_fields`' real contents shows up
+    // as a failure rather than as silently-Unset spans.
+
+    #[test]
+    fn openai_fixture_yields_an_ok_span_from_nested_finish_reason() {
+        use crate::preprocessing::otel_builder::StatusCode;
+
+        let content = fixture("openai_chat_completions.log");
+        let out = Preprocessor::new(default_config()).run("h-openai", "t", &content);
+
+        assert!(
+            out.otel_spans.iter().any(|s| s.status.code == StatusCode::Ok),
+            "the OpenAI fixture carries choices[0].finish_reason=stop, so at least \
+             one span must be affirmatively Ok — all-Unset means status() is not \
+             seeing the shape the extractor produces",
+        );
+    }
+
+    #[test]
+    fn mcp_fixture_yields_an_error_span_from_the_jsonrpc_envelope() {
+        use crate::preprocessing::otel_builder::StatusCode;
+
+        let content = fixture("mcp_session.log");
+        let out = Preprocessor::new(default_config()).run("h-mcp", "t", &content);
+
+        let errors: Vec<_> = out
+            .otel_spans
+            .iter()
+            .filter(|s| s.status.code == StatusCode::Error)
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "the MCP fixture contains a JSON-RPC error envelope, so a span must be Error",
+        );
+        assert!(
+            errors.iter().any(|s| s.status.message.contains("-32602")),
+            "the error code belongs in the status message, got: {:?}",
+            errors.iter().map(|s| &s.status.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn bedrock_multiline_fixture_yields_an_error_from_plaintext_severity() {
+        use crate::preprocessing::otel_builder::StatusCode;
+
+        let content = fixture("bedrock_multiline.log");
+        let out = Preprocessor::new(default_config()).run("h-bedrock", "t", &content);
+
+        // Plain-text lines produce no key/value pairs, so this can only pass via
+        // the raw_text severity fallback.
+        if !out.otel_spans.is_empty() {
+            assert!(
+                out.otel_spans.iter().any(|s| s.status.code == StatusCode::Error),
+                "the bedrock fixture has an `ERROR ... ThrottlingException` line",
+            );
+        }
+    }
+
+    #[test]
+    fn nginx_fixture_does_not_invent_error_spans() {
+        use crate::preprocessing::otel_builder::StatusCode;
+
+        // A plain access log is non-agentic; whatever spans it yields must not be
+        // spuriously marked failed by a stray `error`-looking token in a URL.
+        let content = fixture("nginx_access.log");
+        let out = Preprocessor::new(default_config()).run("h-nginx", "t", &content);
+
+        assert!(
+            out.otel_spans.iter().all(|s| s.status.code != StatusCode::Error),
+            "no nginx access-log span should be Error",
+        );
+    }
 }

@@ -525,8 +525,17 @@ pub enum RelationType {
 
 /// A single parsed log event, typed and enriched by UpsideGate stages 6–7.
 ///
-/// Stored inside [`SampleMetadata::entities`]; also written to the
-/// `entity_nodes` collection when the graph writer is enabled.
+/// Stored **only** inside [`SampleMetadata::entities`] — there is no separate
+/// entity collection. `GraphWriter` persists relations, PROV triples and spans
+/// to their own collections, but entities stay embedded in the owning
+/// `sample_metadata` document.
+///
+/// That is why looking one up by id
+/// ([`MongoRepository::fetch_entity_by_id`]) queries `sample_metadata` with a
+/// positional projection rather than a collection scan, and why
+/// `entities.entity_id` carries a multikey index.
+///
+/// [`MongoRepository::fetch_entity_by_id`]: crate::repository::MongoRepository::fetch_entity_by_id
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityRecord {
     /// Stable content-derived identifier (32-hex-char SHA-256 of

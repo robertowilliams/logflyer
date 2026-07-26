@@ -26,11 +26,13 @@
 //! | `ug.mcp.server` | `mcp_server_id` | McpEvent |
 //! | `ug.token.count` | `token_count` | if present |
 //! | `ug.latency.ms` | `latency_ms` | if present |
+//! | `ug.finish.reason` | `finish_reason` | CompletionEvent, if present |
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::stats;
 use crate::models::{EntityRecord, EntityType};
 
 // ─── OTel types ───────────────────────────────────────────────────────────────
@@ -204,9 +206,232 @@ fn build_attributes(entity: &EntityRecord) -> HashMap<String, AttributeValue> {
             AttributeValue::Int(latency as i64),
         );
     }
+    // Recorded for every completion, including reasons that do not affect
+    // status — notably `length`, which is how a truncated generation stays
+    // queryable without being counted as an error. See
+    // [`ABNORMAL_FINISH_REASONS`].
+    if let Some(reason) = finish_reason(&entity.extracted_fields) {
+        attrs.insert(
+            "ug.finish.reason".to_string(),
+            AttributeValue::String(reason),
+        );
+    }
 
     attrs
 }
+
+/// Derive the OTel status for a span from the entity's extracted fields.
+///
+/// `extracted_fields` holds the log line's top-level keys verbatim — unflattened
+/// and untyped — so error signals arrive in several shapes depending on what
+/// produced the line:
+///
+/// | Shape                              | Source                            |
+/// |------------------------------------|-----------------------------------|
+/// | `error: { code, message }`          | JSON-RPC 2.0 error envelope       |
+/// | `error: "some message"` / `true`    | generic structured logging        |
+/// | `result: { isError: true }`         | MCP tool-level failure convention |
+/// | `level`/`severity: "error"`         | conventional log severity         |
+/// | `finish_reason: "content_filter"`   | LLM refusal                       |
+/// | `finish_reason: "length"`           | LLM truncation                    |
+///
+/// **Policy choice worth knowing about:** `finish_reason` values of `"length"`
+/// and `"content_filter"` are treated as errors, because in both cases the
+/// completion did not finish as intended — but neither is an error in the
+/// transport sense, and a deployment that routinely runs completions up against
+/// the token ceiling may prefer to see `length` as `Ok`. That decision lives
+/// entirely in [`ABNORMAL_FINISH_REASONS`], so it is a one-line change.
+///
+/// `Ok` is set affirmatively when a line carries positive evidence of success,
+/// rather than leaving everything non-erroring as `Unset` — it lets the
+/// SpansView waterfall distinguish "succeeded" from "we cannot tell".
+fn status(entity: &EntityRecord) -> SpanStatus {
+    let fields = &entity.extracted_fields;
+
+    // 1. Explicit error field, under any of its common spellings.
+    for key in ERROR_KEYS {
+        if let Some(value) = fields.get(*key) {
+            if let Some(message) = error_message(value) {
+                return SpanStatus { code: StatusCode::Error, message };
+            }
+        }
+    }
+
+    // 2. MCP tool-level failure: `result.isError == true`.
+    if fields
+        .get("result")
+        .and_then(|r| r.as_object())
+        .and_then(|r| r.get("isError"))
+        .is_some_and(is_truthy)
+    {
+        return SpanStatus {
+            code: StatusCode::Error,
+            message: "tool reported isError".to_string(),
+        };
+    }
+
+    // 3. Structured log severity.
+    for key in LEVEL_KEYS {
+        if let Some(level) = fields.get(*key).and_then(|v| v.as_str()) {
+            if is_error_level(level) {
+                return SpanStatus {
+                    code: StatusCode::Error,
+                    message: format!("{key}={level}"),
+                };
+            }
+        }
+    }
+
+    // 4. Unstructured severity, for plain-text and multiline samples where the
+    //    extractors produce no key/value pairs at all — without this, an
+    //    `ERROR InvokeModel failed: ThrottlingException` line would be Unset.
+    //    Reuses the scanner behind `SampleStats.level_distribution` so severity
+    //    classification is not reimplemented here.
+    if fields.is_empty() {
+        if let Some(level) = stats::extract_level_plain(&entity.raw_text) {
+            if is_error_level(&level) {
+                return SpanStatus {
+                    code: StatusCode::Error,
+                    message: format!("level={level}"),
+                };
+            }
+        }
+    }
+
+    // 5. LLM completion outcome.
+    if let Some(reason) = finish_reason(fields) {
+        let lowered = reason.to_ascii_lowercase();
+        if ABNORMAL_FINISH_REASONS.contains(&lowered.as_str()) {
+            return SpanStatus {
+                code: StatusCode::Error,
+                message: format!("finish_reason={reason}"),
+            };
+        }
+        if NORMAL_FINISH_REASONS.contains(&lowered.as_str()) {
+            return SpanStatus {
+                code: StatusCode::Ok,
+                message: String::new(),
+            };
+        }
+    }
+
+    SpanStatus::default()
+}
+
+/// Field names that carry an error indication.
+///
+/// `err` is the dominant Go/logfmt spelling and `exception` the common Python
+/// one, so matching only `error` would miss most non-JSON-RPC sources.
+const ERROR_KEYS: &[&str] = &["error", "err", "exception", "error_message", "errorMessage"];
+
+/// Field names that carry a conventional log severity.
+const LEVEL_KEYS: &[&str] = &["level", "severity", "log_level", "lvl", "loglevel"];
+
+/// Values that look like "no error" once stringified.
+///
+/// This matters because [`extract_logfmt_fields`] types **every** value as a
+/// string: a logfmt line reading `error=false` arrives as `"false"`, not
+/// `Bool(false)`, so without this list the most common way of saying "there was
+/// no error" would be read as an error — exactly inverted.
+///
+/// [`extract_logfmt_fields`]: super::entity_extractor
+const FALSEY: &[&str] = &["", "null", "nil", "<nil>", "none", "false", "no", "0", "-", "n/a"];
+
+/// Whether a value indicates an error, and if so the message to record.
+///
+/// Returns `None` when the value means "no error".
+fn error_message(value: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match value {
+        // `error: null` is the JSON-RPC *success* spelling.
+        Value::Null => None,
+        Value::Bool(false) => None,
+        Value::Bool(true) => Some("error".to_string()),
+        // A zero error code conventionally means success.
+        Value::Number(n) if n.as_f64() == Some(0.0) => None,
+        Value::Number(n) => Some(format!("error code {n}")),
+        Value::String(s) if FALSEY.contains(&s.trim().to_ascii_lowercase().as_str()) => None,
+        Value::String(s) => Some(s.clone()),
+        // JSON-RPC envelope: { "code": -32601, "message": "Method not found" }
+        Value::Object(obj) => {
+            let message = obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "error".to_string());
+            // Codes are usually numeric but may be symbolic (`"E_TIMEOUT"`).
+            let code = obj.get("code").and_then(|c| match c {
+                Value::Number(n) => Some(n.to_string()),
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            });
+            Some(match code {
+                Some(code) => format!("{message} (code {code})"),
+                None => message,
+            })
+        }
+        // An empty array is the "no errors" spelling used by some aggregators.
+        Value::Array(items) if items.is_empty() => None,
+        Value::Array(_) => Some("error".to_string()),
+    }
+}
+
+/// Truthiness across both JSON booleans and logfmt's stringified ones.
+fn is_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => !FALSEY.contains(&s.trim().to_ascii_lowercase().as_str()),
+        serde_json::Value::Number(n) => n.as_f64() != Some(0.0),
+        _ => false,
+    }
+}
+
+/// Whether a severity string denotes failure.
+///
+/// Canonicalises through [`stats::extract_level_plain`] rather than holding its
+/// own alias table, so `err`, `crit`, `emerg` and friends resolve the same way
+/// they do in `SampleStats.level_distribution`.
+fn is_error_level(level: &str) -> bool {
+    let canonical = stats::extract_level_plain(level).unwrap_or_else(|| level.to_ascii_lowercase());
+    matches!(
+        canonical.as_str(),
+        "error" | "critical" | "fatal" | "alert" | "emergency" | "panic"
+    )
+}
+
+/// Find `finish_reason`, whether at the top level or nested under `choices`.
+///
+/// `extracted_fields` holds only the line's **top-level** keys, but the OpenAI
+/// wire format puts the reason at `choices[0].finish_reason`. Without this the
+/// completion-outcome branch would never fire on the most common shape there is.
+fn finish_reason(fields: &HashMap<String, serde_json::Value>) -> Option<String> {
+    if let Some(reason) = fields.get("finish_reason").and_then(|v| v.as_str()) {
+        return Some(reason.to_string());
+    }
+    // `choices` is an array of per-candidate objects; the first is the one the
+    // caller acted on.
+    fields
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(|r| r.as_str())
+        .map(str::to_string)
+}
+
+/// `finish_reason` values meaning the completion did not finish as intended.
+///
+/// Only `content_filter` — a refused generation is a failed operation. `length`
+/// is deliberately **not** here: hitting the token ceiling is routine for
+/// streaming and summarisation workloads, and OTel reserves `Error` for
+/// operations that failed, so marking truncation as an error would inflate any
+/// error rate derived from span status. The reason is still recorded as the
+/// `ug.finish.reason` attribute, so truncation remains queryable without being
+/// counted as a failure.
+const ABNORMAL_FINISH_REASONS: &[&str] = &["content_filter"];
+
+/// `finish_reason` values meaning the completion finished cleanly.
+const NORMAL_FINISH_REASONS: &[&str] = &["stop", "tool_calls", "function_call", "end_turn"];
 
 /// Derive start/end timestamps in Unix nanoseconds.
 ///
@@ -255,7 +480,7 @@ pub fn build(entities: &[EntityRecord], sample_hash: &str) -> Vec<OtelSpan> {
                 start_time_unix_nano: start,
                 end_time_unix_nano: end,
                 attributes: build_attributes(e),
-                status: SpanStatus::default(),
+                status: status(e),
                 sample_hash: sample_hash.to_string(),
             }
         })
@@ -668,15 +893,416 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Status default
+    // Status derivation
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// Build a one-span slice from an entity carrying `fields`.
+    fn status_for(fields: serde_json::Value) -> SpanStatus {
+        let mut e = make_entity(EntityType::CompletionEvent, SemanticRole::Unknown);
+        e.extracted_fields = fields
+            .as_object()
+            .expect("test fields must be a JSON object")
+            .clone()
+            .into_iter()
+            .collect();
+        build(&[e], "sh")[0].status.clone()
+    }
+
     #[test]
-    fn span_status_defaults_to_unset() {
+    fn span_status_is_unset_without_any_signal() {
         let e = make_entity(EntityType::PromptEvent, SemanticRole::Unknown);
         let span = &build(&[e], "sh")[0];
         assert_eq!(span.status.code, StatusCode::Unset);
         assert!(span.status.message.is_empty());
+    }
+
+    // ── JSON-RPC error envelope ──────────────────────────────────────────────
+
+    #[test]
+    fn jsonrpc_error_object_sets_error_with_code_and_message() {
+        let s = status_for(serde_json::json!({
+            "error": { "code": -32601, "message": "Method not found" }
+        }));
+        assert_eq!(s.code, StatusCode::Error);
+        assert_eq!(s.message, "Method not found (code -32601)");
+    }
+
+    #[test]
+    fn jsonrpc_error_object_without_code_still_errors() {
+        let s = status_for(serde_json::json!({ "error": { "message": "boom" } }));
+        assert_eq!(s.code, StatusCode::Error);
+        assert_eq!(s.message, "boom");
+    }
+
+    #[test]
+    fn null_error_field_is_the_jsonrpc_success_spelling() {
+        // `{"error": null}` accompanies a successful JSON-RPC response and must
+        // not be read as a failure.
+        let s = status_for(serde_json::json!({ "error": null }));
+        assert_eq!(s.code, StatusCode::Unset);
+    }
+
+    #[test]
+    fn false_error_field_is_not_an_error() {
+        let s = status_for(serde_json::json!({ "error": false }));
+        assert_eq!(s.code, StatusCode::Unset);
+    }
+
+    #[test]
+    fn empty_error_string_is_not_an_error() {
+        assert_eq!(status_for(serde_json::json!({ "error": "" })).code, StatusCode::Unset);
+        assert_eq!(status_for(serde_json::json!({ "error": "null" })).code, StatusCode::Unset);
+    }
+
+    // ── logfmt: every value arrives as a string ──────────────────────────────
+    // `extract_logfmt_fields` types everything as Value::String, so the Bool
+    // arms are unreachable for any non-JSON source. These cases are the ones
+    // that actually occur in the wild.
+
+    #[test]
+    fn logfmt_error_false_is_not_an_error() {
+        // The critical case: `error=false` is the commonest way of saying "no
+        // error", and reading it as a failure would invert the meaning of the
+        // line. It arrives as the STRING "false", never as Bool(false).
+        let s = status_for(serde_json::json!({ "error": "false" }));
+        assert_eq!(s.code, StatusCode::Unset);
+    }
+
+    #[test]
+    fn logfmt_falsey_error_spellings_are_not_errors() {
+        for spelling in ["false", "FALSE", "nil", "<nil>", "none", "None", "no", "0", "-", "n/a", " "] {
+            assert_eq!(
+                status_for(serde_json::json!({ "error": spelling })).code,
+                StatusCode::Unset,
+                "error={spelling:?} must not be treated as a failure",
+            );
+        }
+    }
+
+    #[test]
+    fn logfmt_error_true_is_an_error() {
+        assert_eq!(
+            status_for(serde_json::json!({ "error": "true" })).code,
+            StatusCode::Error,
+        );
+    }
+
+    #[test]
+    fn logfmt_is_error_string_is_respected() {
+        // `result.isError` may also arrive stringified.
+        assert_eq!(
+            status_for(serde_json::json!({ "result": { "isError": "true" } })).code,
+            StatusCode::Error,
+        );
+        assert_eq!(
+            status_for(serde_json::json!({ "result": { "isError": "false" } })).code,
+            StatusCode::Unset,
+        );
+    }
+
+    // ── Alternate error key spellings ────────────────────────────────────────
+
+    #[test]
+    fn alternate_error_keys_are_recognised() {
+        for key in ["error", "err", "exception", "error_message", "errorMessage"] {
+            let s = status_for(serde_json::json!({ key: "it broke" }));
+            assert_eq!(s.code, StatusCode::Error, "{key} must be recognised");
+            assert_eq!(s.message, "it broke");
+        }
+    }
+
+    // ── Numeric and array error values ──────────────────────────────────────
+
+    #[test]
+    fn zero_error_code_is_success() {
+        assert_eq!(status_for(serde_json::json!({ "error": 0 })).code, StatusCode::Unset);
+    }
+
+    #[test]
+    fn nonzero_error_code_is_an_error() {
+        let s = status_for(serde_json::json!({ "error": 500 }));
+        assert_eq!(s.code, StatusCode::Error);
+        assert_eq!(s.message, "error code 500");
+    }
+
+    #[test]
+    fn empty_error_array_is_not_an_error() {
+        assert_eq!(status_for(serde_json::json!({ "error": [] })).code, StatusCode::Unset);
+        assert_eq!(
+            status_for(serde_json::json!({ "error": ["boom"] })).code,
+            StatusCode::Error,
+        );
+    }
+
+    #[test]
+    fn symbolic_error_code_is_kept_in_the_message() {
+        let s = status_for(serde_json::json!({
+            "error": { "code": "E_TIMEOUT", "message": "upstream timed out" }
+        }));
+        assert_eq!(s.code, StatusCode::Error);
+        assert_eq!(s.message, "upstream timed out (code E_TIMEOUT)");
+    }
+
+    #[test]
+    fn error_string_becomes_the_status_message() {
+        let s = status_for(serde_json::json!({ "error": "connection refused" }));
+        assert_eq!(s.code, StatusCode::Error);
+        assert_eq!(s.message, "connection refused");
+    }
+
+    // ── MCP tool-level failure ───────────────────────────────────────────────
+
+    #[test]
+    fn mcp_result_is_error_true_sets_error() {
+        let s = status_for(serde_json::json!({
+            "result": { "isError": true, "content": [] }
+        }));
+        assert_eq!(s.code, StatusCode::Error);
+        assert_eq!(s.message, "tool reported isError");
+    }
+
+    #[test]
+    fn mcp_result_is_error_false_is_not_an_error() {
+        let s = status_for(serde_json::json!({
+            "result": { "isError": false, "content": [] }
+        }));
+        assert_eq!(s.code, StatusCode::Unset);
+    }
+
+    #[test]
+    fn mcp_result_without_is_error_is_not_an_error() {
+        let s = status_for(serde_json::json!({ "result": { "content": [] } }));
+        assert_eq!(s.code, StatusCode::Unset);
+    }
+
+    // ── Conventional log severity ────────────────────────────────────────────
+
+    #[test]
+    fn error_level_sets_error() {
+        for key in ["level", "severity", "log_level", "lvl", "loglevel"] {
+            let s = status_for(serde_json::json!({ key: "error" }));
+            assert_eq!(s.code, StatusCode::Error, "{key} must be recognised");
+            assert_eq!(s.message, format!("{key}=error"));
+        }
+    }
+
+    #[test]
+    fn error_level_matching_is_case_insensitive() {
+        assert_eq!(status_for(serde_json::json!({ "level": "ERROR" })).code, StatusCode::Error);
+        assert_eq!(status_for(serde_json::json!({ "level": "Fatal" })).code, StatusCode::Error);
+    }
+
+    #[test]
+    fn benign_levels_do_not_set_error() {
+        for level in ["info", "debug", "warn", "trace"] {
+            assert_eq!(
+                status_for(serde_json::json!({ "level": level })).code,
+                StatusCode::Unset,
+                "{level} must not be an error",
+            );
+        }
+    }
+
+    // ── LLM completion outcome ───────────────────────────────────────────────
+
+    #[test]
+    fn normal_finish_reason_sets_ok() {
+        for reason in ["stop", "tool_calls", "function_call", "end_turn"] {
+            let s = status_for(serde_json::json!({ "finish_reason": reason }));
+            assert_eq!(s.code, StatusCode::Ok, "{reason} is a clean finish");
+            assert!(s.message.is_empty());
+        }
+    }
+
+    #[test]
+    fn content_filter_finish_reason_sets_error() {
+        let s = status_for(serde_json::json!({ "finish_reason": "content_filter" }));
+        assert_eq!(s.code, StatusCode::Error, "a refused generation is a failure");
+        assert_eq!(s.message, "finish_reason=content_filter");
+    }
+
+    #[test]
+    fn length_finish_reason_is_not_an_error() {
+        // Hitting the token ceiling is routine, and OTel reserves Error for
+        // operations that failed — counting truncation would inflate any error
+        // rate derived from span status.
+        let s = status_for(serde_json::json!({ "finish_reason": "length" }));
+        assert_eq!(s.code, StatusCode::Unset);
+    }
+
+    #[test]
+    fn finish_reason_is_recorded_as_an_attribute_even_when_status_ignores_it() {
+        // `length` must remain queryable despite not affecting status.
+        let mut e = make_entity(EntityType::CompletionEvent, SemanticRole::Unknown);
+        e.extracted_fields = serde_json::json!({ "finish_reason": "length" })
+            .as_object()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .collect();
+        let span = &build(&[e], "sh")[0];
+        assert_eq!(
+            span.attributes.get("ug.finish.reason"),
+            Some(&AttributeValue::String("length".to_string())),
+        );
+    }
+
+    #[test]
+    fn unrecognised_finish_reason_stays_unset() {
+        let s = status_for(serde_json::json!({ "finish_reason": "something_new" }));
+        assert_eq!(s.code, StatusCode::Unset);
+    }
+
+    // ── Nested finish_reason (the OpenAI wire shape) ─────────────────────────
+
+    #[test]
+    fn finish_reason_is_found_under_choices() {
+        // `extracted_fields` holds only top-level keys, but OpenAI puts the
+        // reason at choices[0].finish_reason — the commonest shape there is.
+        let s = status_for(serde_json::json!({
+            "choices": [ { "index": 0, "finish_reason": "stop" } ]
+        }));
+        assert_eq!(s.code, StatusCode::Ok);
+    }
+
+    #[test]
+    fn nested_content_filter_still_errors() {
+        let s = status_for(serde_json::json!({
+            "choices": [ { "finish_reason": "content_filter" } ]
+        }));
+        assert_eq!(s.code, StatusCode::Error);
+    }
+
+    #[test]
+    fn top_level_finish_reason_wins_over_nested() {
+        let s = status_for(serde_json::json!({
+            "finish_reason": "content_filter",
+            "choices": [ { "finish_reason": "stop" } ],
+        }));
+        assert_eq!(s.code, StatusCode::Error);
+    }
+
+    #[test]
+    fn empty_choices_array_is_harmless() {
+        assert_eq!(
+            status_for(serde_json::json!({ "choices": [] })).code,
+            StatusCode::Unset,
+        );
+    }
+
+    // ── Unstructured severity ────────────────────────────────────────────────
+
+    /// Status for an entity with no structured fields, only `raw_text`.
+    fn status_for_raw(raw: &str) -> SpanStatus {
+        let mut e = make_entity(EntityType::Unknown, SemanticRole::Unknown);
+        e.raw_text = raw.to_string();
+        build(&[e], "sh")[0].status.clone()
+    }
+
+    #[test]
+    fn plaintext_error_line_sets_error() {
+        // Multiline / plain-text samples yield no key-value pairs at all, so
+        // without a raw_text fallback every such span would be Unset.
+        let s = status_for_raw("2026-04-26 10:00:02 ERROR InvokeModel failed: ThrottlingException");
+        assert_eq!(s.code, StatusCode::Error);
+    }
+
+    #[test]
+    fn plaintext_bracketed_fatal_sets_error() {
+        assert_eq!(
+            status_for_raw("[FATAL] could not open socket").code,
+            StatusCode::Error,
+        );
+    }
+
+    #[test]
+    fn plaintext_info_line_stays_unset() {
+        assert_eq!(
+            status_for_raw("2026-04-26 10:00:01 INFO InvokeModel ok").code,
+            StatusCode::Unset,
+        );
+    }
+
+    #[test]
+    fn structured_fields_suppress_the_raw_text_scan() {
+        // With structured fields present, the word "error" appearing in a
+        // message must not by itself fail the span — the level field is
+        // authoritative.
+        let mut e = make_entity(EntityType::CompletionEvent, SemanticRole::Unknown);
+        e.raw_text = r#"{"level":"info","msg":"retrying after error"}"#.to_string();
+        e.extracted_fields = serde_json::json!({ "level": "info", "msg": "retrying after error" })
+            .as_object()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .collect();
+        assert_eq!(build(&[e], "sh")[0].status.code, StatusCode::Unset);
+    }
+
+    // ── Severity aliases shared with stats ──────────────────────────────────
+
+    #[test]
+    fn severity_aliases_resolve_like_the_stats_scanner() {
+        for level in ["err", "crit", "emerg", "alert", "emergency", "critical", "fatal"] {
+            assert_eq!(
+                status_for(serde_json::json!({ "level": level })).code,
+                StatusCode::Error,
+                "{level} must count as a failure",
+            );
+        }
+    }
+
+    #[test]
+    fn notice_and_warn_aliases_are_not_errors() {
+        for level in ["notice", "wrn", "warning", "inf", "dbg", "trc"] {
+            assert_eq!(
+                status_for(serde_json::json!({ "level": level })).code,
+                StatusCode::Unset,
+                "{level} must not count as a failure",
+            );
+        }
+    }
+
+    // ── Precedence ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn explicit_error_outranks_a_clean_finish_reason() {
+        // A line can carry both; the error is the more specific signal.
+        let s = status_for(serde_json::json!({
+            "finish_reason": "stop",
+            "error": { "message": "downstream failed" },
+        }));
+        assert_eq!(s.code, StatusCode::Error);
+        assert_eq!(s.message, "downstream failed");
+    }
+
+    #[test]
+    fn error_level_outranks_a_clean_finish_reason() {
+        let s = status_for(serde_json::json!({
+            "finish_reason": "stop",
+            "level": "error",
+        }));
+        assert_eq!(s.code, StatusCode::Error);
+    }
+
+    // ── Serialisation ────────────────────────────────────────────────────────
+
+    #[test]
+    fn status_serialises_in_otel_screaming_snake_case() {
+        let s = status_for(serde_json::json!({ "error": "x" }));
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["code"], "ERROR");
+    }
+
+    #[test]
+    fn empty_status_message_is_omitted_from_the_document() {
+        let s = status_for(serde_json::json!({ "finish_reason": "stop" }));
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["code"], "OK");
+        assert!(
+            json.get("message").is_none(),
+            "an empty message must be skipped, not stored as \"\"",
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
