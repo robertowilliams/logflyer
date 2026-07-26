@@ -60,24 +60,24 @@
     </div>
 
     <!-- Content drawer -->
-    <div v-if="selected !== null && store.samples[selected] != null" class="card bg-[#0a0a0a] border-[#dc143c]/30">
+    <div v-if="selectedSample" class="card bg-[#0a0a0a] border-[#dc143c]/30">
       <div class="flex justify-between items-center mb-3">
         <div>
           <span class="text-[rgba(245,245,220,0.80)] font-semibold text-sm">Sample Content</span>
-          <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ store.samples[selected!].source_file }}</span>
+          <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ selectedSample.source_file }}</span>
         </div>
         <div class="flex items-center gap-3">
           <button
-            @click="openDeleteDialog(store.samples[selected!])"
+            @click="openDeleteDialog(selectedSample)"
             class="text-[rgba(245,245,220,0.30)] hover:text-[#ff6b8a] transition-colors text-xs flex items-center gap-1"
           ><Trash2 :size="13" />Delete</button>
           <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors"><X :size="16" /></button>
         </div>
       </div>
-      <pre v-if="store.samples[selected!].sample_content" class="text-xs text-[#00d4ff] overflow-auto whitespace-pre-wrap max-h-[500px]">{{ store.samples[selected!].sample_content }}</pre>
+      <pre v-if="selectedSample.sample_content" class="text-xs text-[#00d4ff] overflow-auto whitespace-pre-wrap max-h-[500px]">{{ selectedSample.sample_content }}</pre>
       <p v-else class="text-xs text-[rgba(245,245,220,0.30)] italic">No content captured.</p>
-      <div v-if="store.samples[selected!].error_details" class="mt-3 text-[#ff6b8a] text-xs">
-        Error: {{ store.samples[selected!].error_details }}
+      <div v-if="selectedSample.error_details" class="mt-3 text-[#ff6b8a] text-xs">
+        Error: {{ selectedSample.error_details }}
       </div>
     </div>
 
@@ -127,7 +127,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { RefreshCw, ChevronLeft, ChevronRight, Trash2, X } from 'lucide-vue-next'
 import { useLogflayerStore } from '../stores/logflayer'
 import { client } from '../api/client'
@@ -138,6 +138,20 @@ const targetId = ref('')
 const page = ref(1)
 const limit = 50
 const selected = ref<number | null>(null)
+
+/** The sample the content drawer is showing, resolved once.
+ *
+ *  `selected` is an index into `store.samples`, and indexing yields
+ *  `T | undefined` under `noUncheckedIndexedAccess` — so reading it directly in
+ *  the template required a non-null assertion at every use site. Resolving it
+ *  here lets the template do one truthiness check and narrows everything below.
+ *
+ *  Behaviour is unchanged: the old template already guarded on
+ *  `store.samples[selected] != null`, and `load` resets `selected` on every page
+ *  change. This is a type-level cleanup, not a bug fix. */
+const selectedSample = computed<SampleRecord | null>(() =>
+  selected.value === null ? null : store.samples[selected.value] ?? null,
+)
 
 // ── Delete dialog state ──────────────────────────────────────────────────────
 const deleteTarget = ref<SampleRecord | null>(null)

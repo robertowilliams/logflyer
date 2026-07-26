@@ -4,6 +4,15 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
     "target": "ES2022",
     "lib": ["ES2023"],
+    // Scope ambient types to Node only. Without this, TypeScript auto-includes
+    // every package under node_modules/@types — which pulls in
+    // @types/web-bluetooth (a transitive dependency of @vueuse/core) whose
+    // global declarations need the DOM lib this project deliberately omits,
+    // producing ~22 errors in a file we do not own.
+    "types": ["node"],
+    // Belt and braces: never type-check inside dependencies' .d.ts files. The
+    // app project already sets this; the node project had been missing it.
+    "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,

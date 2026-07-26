@@ -68,12 +68,12 @@
     </div>
 
     <!-- Detail drawer -->
-    <div v-if="selected !== null && filtered[selected] != null" class="card bg-[#0a0a0a] border-[#dc143c]/30 space-y-4">
+    <div v-if="selectedRecord" class="card bg-[#0a0a0a] border-[#dc143c]/30 space-y-4">
       <div class="flex justify-between items-start">
         <div>
-          <span :class="severityClass(filtered[selected!].severity)" class="text-sm mr-3">{{ filtered[selected!].severity.toUpperCase() }}</span>
-          <span class="text-[rgba(245,245,220,0.80)] font-semibold text-sm">{{ filtered[selected!].target_id }}</span>
-          <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ fmt(filtered[selected!].classified_at) }}</span>
+          <span :class="severityClass(selectedRecord.severity)" class="text-sm mr-3">{{ selectedRecord.severity.toUpperCase() }}</span>
+          <span class="text-[rgba(245,245,220,0.80)] font-semibold text-sm">{{ selectedRecord.target_id }}</span>
+          <span class="text-[rgba(245,245,220,0.40)] text-xs ml-3">{{ fmt(selectedRecord.classified_at) }}</span>
         </div>
         <button @click="selected = null" class="text-[rgba(245,245,220,0.40)] hover:text-[#f5f5dc] transition-colors flex-shrink-0 ml-4"><X :size="16" /></button>
       </div>
@@ -81,15 +81,15 @@
       <!-- Summary -->
       <div>
         <div class="text-xs text-[rgba(245,245,220,0.50)] uppercase tracking-wide mb-1">Summary</div>
-        <p class="text-[rgba(245,245,220,0.80)] text-sm leading-relaxed">{{ filtered[selected!].summary }}</p>
+        <p class="text-[rgba(245,245,220,0.80)] text-sm leading-relaxed">{{ selectedRecord.summary }}</p>
       </div>
 
       <!-- Key findings -->
-      <div v-if="filtered[selected!].key_findings.length > 0">
+      <div v-if="selectedRecord.key_findings.length > 0">
         <div class="text-xs text-[rgba(245,245,220,0.50)] uppercase tracking-wide mb-2">Key Findings</div>
         <div class="space-y-2">
           <div
-            v-for="(f, fi) in filtered[selected!].key_findings"
+            v-for="(f, fi) in selectedRecord.key_findings"
             :key="fi"
             class="bg-[#0f0f0f] rounded p-3 border border-[#dc143c]/10"
           >
@@ -104,11 +104,11 @@
       </div>
 
       <!-- Recommendations -->
-      <div v-if="filtered[selected!].recommendations.length > 0">
+      <div v-if="selectedRecord.recommendations.length > 0">
         <div class="text-xs text-[rgba(245,245,220,0.50)] uppercase tracking-wide mb-2">Recommendations</div>
         <ul class="space-y-1">
           <li
-            v-for="(r, ri) in filtered[selected!].recommendations"
+            v-for="(r, ri) in selectedRecord.recommendations"
             :key="ri"
             class="text-sm text-[rgba(245,245,220,0.70)] flex items-start gap-2"
           >
@@ -119,12 +119,12 @@
 
       <!-- Footer metadata -->
       <div class="border-t border-[#dc143c]/10 pt-3 flex flex-wrap gap-4 text-xs text-[rgba(245,245,220,0.30)]">
-        <span>Model: <span class="text-[rgba(245,245,220,0.50)]">{{ filtered[selected!].model }}</span></span>
-        <span>In: <span class="text-[rgba(245,245,220,0.50)]">{{ filtered[selected!].input_tokens }} tok</span></span>
-        <span>Out: <span class="text-[rgba(245,245,220,0.50)]">{{ filtered[selected!].output_tokens }} tok</span></span>
-        <span>Confidence: <span class="text-[rgba(245,245,220,0.50)]">{{ (filtered[selected!].confidence * 100).toFixed(0) }}%</span></span>
+        <span>Model: <span class="text-[rgba(245,245,220,0.50)]">{{ selectedRecord.model }}</span></span>
+        <span>In: <span class="text-[rgba(245,245,220,0.50)]">{{ selectedRecord.input_tokens }} tok</span></span>
+        <span>Out: <span class="text-[rgba(245,245,220,0.50)]">{{ selectedRecord.output_tokens }} tok</span></span>
+        <span>Confidence: <span class="text-[rgba(245,245,220,0.50)]">{{ (selectedRecord.confidence * 100).toFixed(0) }}%</span></span>
         <router-link
-          :to="`/samples?target_id=${filtered[selected!].target_id}`"
+          :to="`/samples?target_id=${selectedRecord.target_id}`"
           class="text-[#00d4ff] hover:underline ml-auto inline-flex items-center gap-1"
         >
           View source sample<ArrowRight :size="14" />
@@ -147,6 +147,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { RefreshCw, ChevronLeft, ChevronRight, ArrowRight, X } from 'lucide-vue-next'
 import { useLogflayerStore } from '../stores/logflayer'
+import type { ClassificationRecord } from '../types'
 
 const store = useLogflayerStore()
 const targetId = ref('')
@@ -160,6 +161,21 @@ const filtered = computed(() => {
   if (!severityFilter.value) return store.classifications
   return store.classifications.filter(c => c.severity === severityFilter.value)
 })
+
+/** The record the detail drawer is showing, resolved once.
+ *
+ *  `selected` is an index, and indexing an array yields `T | undefined` under
+ *  `noUncheckedIndexedAccess` — so reading `filtered[selected]` directly in the
+ *  template needed a non-null assertion at every one of its fourteen use sites.
+ *  Resolving it here instead means the template does a single truthiness check
+ *  and every field access below it is soundly narrowed.
+ *
+ *  Behaviour is unchanged: the old template already guarded on
+ *  `filtered[selected] != null`, and every filter change routes through `load`,
+ *  which resets `selected`. This is a type-level cleanup, not a bug fix. */
+const selectedRecord = computed<ClassificationRecord | null>(() =>
+  selected.value === null ? null : filtered.value[selected.value] ?? null,
+)
 
 function fmt(ts: string) {
   try { return new Date(ts).toLocaleString() } catch { return ts }
