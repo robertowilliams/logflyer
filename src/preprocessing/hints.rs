@@ -1,8 +1,12 @@
 //! Produces [`IngestionHints`] from the other preprocessing outputs.
 //!
-//! The hints module is the final stage of the pipeline.  It synthesises the
+//! The hints module is the last of the original five stages.  It synthesises the
 //! format, stats, and agentic scan results into actionable guidance for the
-//! downstream LLM classifier (logflayersense):
+//! downstream LLM classifier in [`crate::classification`]:
+//!
+//! (Older comments and `PREPROCESSING_PLAN.md` call that consumer
+//! `logflayersense`, a separate service that was never built — the classifier
+//! ships inside this crate.)
 //!
 //! - **`prompt_template`** — which prompt variant best matches this sample.
 //! - **`suggested_chunk_size`** — how many log lines to include per LLM call.

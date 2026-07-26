@@ -2,8 +2,39 @@
 
 **Author:** Roberto Williams Batista  
 **Date:** 2026-04-26  
-**Status:** Draft  
+**Status:** ✅ **Shipped** — Phases 1, 2 and 3 all landed. This is now a record,
+not a forward plan.  
 **Scope:** `logflayer/` (producer) · `vectadb-agents/logflayersense/` (consumer)
+— both exist; see the note below
+
+> **Read this first: classification exists twice.**
+>
+> Phase 2 shipped as planned, in the separate crate the Scope line names:
+> `code/vectadb_engine/vectadb-agents/logflayersense/` (`vectadb-logflayersense`).
+> All four planned files are there and implemented — `mongo_reader.rs`,
+> `prompt_builder.rs`, `classifier.rs`, `main.rs` with a `run_mongo_loop` polling
+> loop. **Note it is untracked in git** (`git status` in `vectadb_engine` shows
+> `?? vectadb-agents/logflayersense/`), so it will not appear in a `git grep` and
+> is not backed up by the repo. Worth committing.
+>
+> But `logflayer` **also** grew an in-process classifier at `src/classification/`
+> (`client.rs`, `prompt.rs`), triggered inline from `service/application.rs`
+> rather than by polling. So there are now two implementations of Phase 2:
+>
+> | Phase 2 step | `logflayersense` (planned, exists) | `logflayer` (also exists) |
+> | --- | --- | --- |
+> | 2.1 read from Mongo | `src/mongo_reader.rs` — polls `sample_metadata` | `repository/mongo.rs::fetch_pending_classifications` — **defined but called only by tests** |
+> | 2.2 build prompt | `src/prompt_builder.rs` | `classification/prompt.rs` |
+> | 2.3 classify | `src/classifier.rs` | `classification/client.rs` |
+> | 2.4 drive it | `src/main.rs` poll loop | inline in `service/application.rs` |
+>
+> **This overlap is unresolved and is the thing to sort out.** Which one is
+> authoritative determines whether `fetch_pending_classifications` is dead code or
+> the real entry point, and whether `CLASSIFICATION_ENABLED` in `logflayer` should
+> default off. It also bears directly on the standalone-vs-monorepo question in
+> `docs/next_steps_may_1st.md` item 10.
+>
+> **Last verified against the code:** July 25, 2026.
 
 ---
 
@@ -161,7 +192,20 @@ Index required on `sample_metadata`:
 
 ## 4. Implementation Plan
 
-### Phase 1 — Preprocessing Pipeline in `logflayer`
+### Phase 1 — Preprocessing Pipeline in `logflayer` — `[shipped]`
+
+> Stages 1–5 landed as described, in `src/preprocessing/`. Two notes:
+>
+> - **The pipeline now has ten stages, not five.** Stages 6–10 (entity
+>   extraction, semantic roles, relations, PROV, OTel) were added by
+>   `UPSIDEGATE_PLAN.md` and live in the same module. `Preprocessor::run` returns
+>   a `PipelineOutput` — `SampleMetadata` **plus** `prov_triples` and
+>   `otel_spans` — not a bare `SampleMetadata` as the steps below imply. Any code
+>   written against the older signature will not compile; that is exactly what
+>   broke `tests/integration_test.rs` for several weeks (fixed in `6f81a13`).
+> - **`stats::extract_level_plain` is now `pub(crate)`** and shared with
+>   `otel_builder`, so severity classification for unstructured lines lives in one
+>   place instead of being reimplemented per consumer.
 
 #### Step 1.1 — Add `SampleMetadata` to `models.rs`
 
@@ -326,20 +370,42 @@ repository.store_metadata(&metadata).await?;
 
 Do not preprocess on `StoreOutcome::Duplicate` — metadata already exists.
 
-#### Step 1.10 — Configuration additions
+#### Step 1.10 — Configuration additions — `[shipped]`
 
-Add to `AppConfig`:
+> **Divergence — env vars, not a TOML table.** No `[preprocessing]` section
+> exists; `PreprocessingConfig` is built by `AppConfig::from_env`, matching how
+> the rest of the config works. The three planned knobs shipped with a
+> `PREPROCESSING_` prefix, and three more were added later.
 
-```toml
-[preprocessing]
-agentic_threshold = 0.02        # minimum signal_score to mark worth_classifying
-max_schema_lines = 200          # lines sampled for schema extraction
-enabled = true                  # kill switch
+**As actually implemented** (`src/config.rs`, all present in `.env.example`):
+
 ```
+PREPROCESSING_ENABLED=true                       # kill switch for the whole pipeline
+PREPROCESSING_AGENTIC_THRESHOLD=0.02             # min signal_score to mark worth_classifying
+PREPROCESSING_MAX_SCHEMA_LINES=200               # lines sampled for schema extraction
+PREPROCESSING_REPROCESS_ON_VERSION_CHANGE=false  # see Step 3.2
+METRICS_PORT=9090                                # note: no PREPROCESSING_ prefix
+
+# Added by UpsideGate (see UPSIDEGATE_PLAN.md §6) — same struct, stages 6–10:
+ENTITY_EXTRACTION_ENABLED=true
+ENTITY_EXTRACTION_MIN_ENTITIES=1
+```
+
+**The two switches are nested, not independent.** `ENTITY_EXTRACTION_ENABLED`
+gates stages 6–10 *within* a pipeline run, so turning it off still produces a
+`SampleMetadata` document — just one with empty `entities` and `relations`. But
+`PREPROCESSING_ENABLED=false` skips the run entirely
+(`service/application.rs`), so **no metadata document is written at all** and
+stages 6–10 never execute regardless of the second flag.
 
 ---
 
-### Phase 2 — Update `logflayersense` to consume metadata
+### Phase 2 — Update `logflayersense` to consume metadata — `[shipped]`
+
+> Shipped as written, in `vectadb-agents/logflayersense/` — all four steps below
+> exist in that crate. But `logflayer` grew a parallel in-process classifier at
+> `src/classification/` as well. See the note at the top of this document: the
+> duplication is real and unresolved.
 
 #### Step 2.1 — `mongo_reader.rs` (new)
 
@@ -409,9 +475,17 @@ Replace the local file watch loop with a MongoDB polling loop using `MongoReader
 
 ---
 
-### Phase 3 — Backfill and Observability
+### Phase 3 — Backfill and Observability — `[shipped]`, with one item dropped
 
-#### Step 3.1 — Backfill command
+#### Step 3.1 — Backfill command — `[shipped]`
+
+> `logflayer backfill --batch-size N --dry-run` works as described
+> (`src/main.rs::run_backfill`, `src/backfill.rs`).
+>
+> **Limitation worth knowing:** backfill rebuilds `SampleMetadata` only. It does
+> not write `entity_edges`, `prov_relations`, `otel_spans` or the embedding
+> collections — the output adapters are wired into the live sampling path only.
+> See `UPSIDEGATE_PLAN.md` §7 for the reasoning and the practical consequence.
 
 Add a CLI subcommand `logflayer backfill` that runs the preprocessing pipeline over all `SampleRecord` documents that have no corresponding `SampleMetadata`. Processes in batches of 100, respects concurrency limit. Useful for existing data and after preprocessing version upgrades.
 
@@ -419,21 +493,43 @@ Add a CLI subcommand `logflayer backfill` that runs the preprocessing pipeline o
 logflayer backfill --batch-size 100 --dry-run
 ```
 
-#### Step 3.2 — Version-aware reprocessing
+#### Step 3.2 — Version-aware reprocessing — `[shipped]`
 
-On startup, `logflayer` checks the `preprocessing_version` field in existing metadata. If the stored version is older than the current binary's version, those records are queued for reprocessing. Controlled by config flag `preprocessing.reprocess_on_version_change = false` (opt-in).
+> The opt-in flag exists as planned, spelled
+> `PREPROCESSING_REPROCESS_ON_VERSION_CHANGE`, defaulting to `false`. `main.rs`
+> gates the startup call on that flag **and** `preprocessing.enabled`, so nothing
+> happens on an ordinary upgrade.
+>
+> **Divergence — stale metadata is deleted, not queued.** When the flag is on,
+> `backfill::purge_stale_metadata` runs a `delete_many` over documents whose
+> `preprocessing_version` differs from the binary's, rather than adding them to a
+> reprocessing queue. The `SampleRecord`s are untouched, so the next backfill or
+> sampling cycle regenerates the metadata from scratch. Deleting cannot leave
+> half-migrated documents behind, which a queue can.
+>
+> There is a second entry point the plan did not anticipate:
+> `logflayer backfill --reprocess_stale`.
+>
+> ⚠️ `PREPROCESSING_REPROCESS_ON_VERSION_CHANGE` is **missing from
+> `.env.example`** — the only env var read in `src/` that is not documented there,
+> aside from the `OPENAI_API_KEY` fallback.
 
-#### Step 3.3 — Metrics
+#### Step 3.3 — Metrics — `[shipped]`, renamed
 
-Expose Prometheus counters from the preprocessing stage:
+> Every planned metric exists in some form, but none kept its planned name.
+> **Use these:**
 
-| Metric | Description |
-|---|---|
-| `logflayer_preprocessed_total` | Total samples preprocessed |
-| `logflayer_agentic_detected_total` | Samples with `worth_classifying = true` |
-| `logflayer_format_detected{type}` | Count per detected log type |
-| `logflayer_preprocessing_duration_ms` | Histogram of pipeline latency |
-| `logflayer_schema_extracted_total` | Samples with schema successfully extracted |
+| Planned | Actual (`src/metrics.rs`) |
+| ------- | ------------------------- |
+| `logflayer_preprocessed_total` | `logflayer_preprocessing_samples_processed_total` |
+| `logflayer_agentic_detected_total` | `logflayer_preprocessing_agentic_signals_total` |
+| `logflayer_preprocessing_duration_ms` | `logflayer_preprocessing_duration_seconds` (seconds, per Prometheus convention) |
+| `logflayer_format_detected{type}` | `logflayer_format_detected` — unchanged |
+| `logflayer_schema_extracted_total` | `logflayer_schema_extracted_total` — unchanged |
+
+Two more were added that the plan did not anticipate:
+`logflayer_preprocessing_samples_skipped_total` and
+`logflayer_preprocessing_errors_total`.
 
 ---
 
@@ -456,21 +552,22 @@ Expose Prometheus counters from the preprocessing stage:
 | `src/lib.rs` | Export `preprocessing` module |
 | `Cargo.toml` | Add `once_cell`, `regex` dependencies |
 
-### `logflayersense/`
+### `logflayersense/` — `[shipped]`, at `code/vectadb_engine/vectadb-agents/logflayersense/`
 
-| File | Action |
-|---|---|
-| `src/mongo_reader.rs` | New — replaces file tailer |
-| `src/prompt_builder.rs` | New |
-| `src/classifier.rs` | Update to accept metadata context |
-| `src/models.rs` | Add `ClassificationStatus` to metadata; import logflayer types or duplicate |
-| `src/main.rs` | Replace file loop with MongoDB poll loop |
-| `src/config.rs` | Replace `log_files` with `mongo` connection config; add `poll_interval` |
-| `Cargo.toml` | Add `mongodb` dependency |
+Every row landed, including the `models.rs` decision: the crate **duplicates**
+the types rather than importing them, so `SampleMetadata` and friends are declared
+in both crates and must be kept in step by hand. `Cargo.toml` carries the
+`mongodb = "2.8"` the plan called for.
+
+`main.rs` kept the legacy `FileTailer` alongside the new `run_mongo_loop`, so the
+file-tailing path was added to rather than replaced.
+
+> ⚠️ **The crate is untracked in git.** Nothing in `vectadb_engine`'s history
+> contains it. Committing it should come before any further work on it.
 
 ---
 
-## 6. Dependencies to Add
+## 6. Dependencies to Add — `[shipped]`
 
 ### `logflayer/Cargo.toml`
 
@@ -481,11 +578,17 @@ regex = "1.10"
 
 `regex` may already be present — confirm before adding.
 
+> Both present. `chrono` also became load-bearing later, for timestamp parsing in
+> `entity_extractor` (`1a3079b`).
+
 ### `logflayersense/Cargo.toml`
 
 ```toml
 mongodb = "2.8"
 ```
+
+> Present as specified. The crate also pulls in `uuid` v4, which `logflayer`
+> deliberately does not (see `UPSIDEGATE_PLAN.md` Phase 0 on derived ids).
 
 ---
 
@@ -534,3 +637,32 @@ Fixture log files live in `logflayer/tests/fixtures/`:
 | M9 | Integration tests | End-to-end test suite |
 
 Each milestone is independently shippable — M1–M5 can be deployed without touching logflayersense at all.
+
+> All nine landed. M6 and M7 shipped as `src/classification/` inside this crate
+> rather than in a second service.
+
+---
+
+## 9. What changed after this plan
+
+This document covers stages 1–5 of what is now a ten-stage pipeline. For
+everything after it:
+
+- **`UPSIDEGATE_PLAN.md`** — stages 6–10 (entity extraction, semantic roles,
+  relations, PROV, OTel), the graph and vector output adapters, MCP parsing, and
+  the config flags that gate all of it. Also carries the decision log and the
+  current list of known gaps.
+- **`SMOKETEST.md`** — how to verify the whole pipeline end to end against a live
+  MongoDB, with real per-fixture figures.
+
+**One operational lesson worth carrying forward.** Three defects in the
+UpsideGate work were invisible to `cargo test --lib` and only showed up when the
+smoke test ran against real data: a field that was never populated, a fixture
+that produced no relations, and edges pointing at a non-entity. All three
+produced plausible-looking output with a whole dimension missing. Unit tests
+cannot catch a field that is uniformly absent, because the assertions get written
+against the same wrong assumption as the code.
+
+So: use `cargo test --all-targets` rather than `--lib` (the integration tests
+went uncompiled for weeks behind a green `--lib`), and re-run `SMOKETEST.md`
+after pipeline changes rather than trusting green unit tests.

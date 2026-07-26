@@ -233,14 +233,25 @@ fn build_attributes(entity: &EntityRecord) -> HashMap<String, AttributeValue> {
 /// | `result: { isError: true }`         | MCP tool-level failure convention |
 /// | `level`/`severity: "error"`         | conventional log severity         |
 /// | `finish_reason: "content_filter"`   | LLM refusal                       |
-/// | `finish_reason: "length"`           | LLM truncation                    |
+/// | `finish_reason: "stop"` / `"length"`| LLM completion outcome            |
 ///
-/// **Policy choice worth knowing about:** `finish_reason` values of `"length"`
-/// and `"content_filter"` are treated as errors, because in both cases the
-/// completion did not finish as intended — but neither is an error in the
-/// transport sense, and a deployment that routinely runs completions up against
-/// the token ceiling may prefer to see `length` as `Ok`. That decision lives
-/// entirely in [`ABNORMAL_FINISH_REASONS`], so it is a one-line change.
+/// Values arrive **untyped**: `extract_logfmt_fields` stores every value as a
+/// `String`, so `error=false` reaches here as `"false"` rather than
+/// `Bool(false)`. See [`FALSEY`] — without it the commonest spelling of "nothing
+/// went wrong" would be read as a failure, exactly inverted.
+///
+/// `finish_reason` is also read from `choices[0]` as well as the top level,
+/// because `extracted_fields` holds only top-level keys and the OpenAI wire
+/// format nests it.
+///
+/// **Policy choice worth knowing about:** only `"content_filter"` counts as an
+/// error — a refused generation is a failed operation. `"length"` does **not**:
+/// hitting the token ceiling is routine for streaming and summarisation
+/// workloads, and OTel reserves `Error` for operations that failed, so counting
+/// truncation would inflate any error rate derived from span status. It is
+/// recorded as the `ug.finish.reason` attribute instead, so it stays queryable
+/// without being counted. That decision lives entirely in
+/// [`ABNORMAL_FINISH_REASONS`], so reversing it is a one-line change.
 ///
 /// `Ok` is set affirmatively when a line carries positive evidence of success,
 /// rather than leaving everything non-erroring as `Unset` — it lets the
