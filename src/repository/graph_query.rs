@@ -80,6 +80,22 @@ pub fn clamp_depth(requested: u32) -> u32 {
     requested.clamp(1, MAX_DEPTH)
 }
 
+/// Relation types whose target is **not** an entity.
+///
+/// `PART_OF` is emitted once per entity by `relation_extractor`'s Rule 8, and
+/// its `target_entity_id` holds the sample's 32-hex OTel trace id rather than an
+/// `entity_id` — the trace is not itself an entity record.
+///
+/// Traversals therefore exclude it by default. Included, it means every single
+/// entity is adjacent to the same pseudo-node, so every walk picks up an
+/// unlabelled dead-end that can never hydrate, inflates `node_count`, and in the
+/// graph view renders as a mystery hub wired to everything. It also carries no
+/// lineage information the caller does not already have: the trace id is on the
+/// sample metadata as `otel_trace_id`.
+///
+/// Callers who want the structural edges can opt back in.
+pub const STRUCTURAL_RELATION_TYPES: &[&str] = &["PART_OF"];
+
 // ─── Minimal edge view ────────────────────────────────────────────────────────
 
 /// The two endpoints of an edge, plus its identity.

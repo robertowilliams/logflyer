@@ -255,6 +255,24 @@ async fn test_skip_logic_not_worth_classifying() {
 // pull one entity out of a `sample_metadata.entities` array, the aggregation
 // that hydrates many, and the per-level `$in` queries against `entity_edges`.
 
+/// Pick an edge that actually connects two entities.
+///
+/// `relations[0]` is a `PART_OF` edge — `emit_part_of` runs first — whose target
+/// is the sample's trace id rather than an entity. Traversal excludes those by
+/// default, so a test that grabs the first relation ends up asserting things
+/// about the trace pseudo-node instead of real lineage.
+/// Note that `mcp_session.log` is **not** usable here: it yields 19 McpEvent
+/// entities and 19 `PART_OF` edges and nothing else, because no relation rule
+/// pairs an MCP request with its response. Use a fixture that produces real
+/// lineage.
+fn first_entity_to_entity_edge(metadata: &SampleMetadata) -> &logflayer::models::RelationEdge {
+    metadata
+        .relations
+        .iter()
+        .find(|r| format!("{:?}", r.relation_type) != "PartOf")
+        .expect("fixture must produce at least one entity-to-entity relation")
+}
+
 /// Seed a sample's metadata plus its edges, and return the stored metadata.
 ///
 /// Edges must go through `GraphWriter` rather than being written directly, so
@@ -377,16 +395,13 @@ async fn test_traverse_graph_follows_edges_in_both_directions() {
         .await
         .expect("connect");
 
-    let metadata = seed_graph(&repo, "hash-trv-001", "tgt-trv", "mcp_session.log").await;
-    let first_edge = metadata
-        .relations
-        .first()
-        .expect("fixture must produce at least one relation");
+    let metadata = seed_graph(&repo, "hash-trv-001", "tgt-trv", "openai_chat_completions.log").await;
+    let first_edge = first_entity_to_entity_edge(&metadata);
     let root = first_edge.source_entity_id.clone();
     let neighbour = first_edge.target_entity_id.clone();
 
     let down = repo
-        .traverse_graph(&root, Direction::Downstream, 3)
+        .traverse_graph(&root, Direction::Downstream, 3, false)
         .await
         .expect("downstream traversal");
 
@@ -405,7 +420,7 @@ async fn test_traverse_graph_follows_edges_in_both_directions() {
     assert!(!down.truncated, "a fixture-sized graph must not hit any budget");
 
     let up = repo
-        .traverse_graph(&neighbour, Direction::Upstream, 3)
+        .traverse_graph(&neighbour, Direction::Upstream, 3, false)
         .await
         .expect("upstream traversal");
     assert!(
@@ -415,12 +430,84 @@ async fn test_traverse_graph_follows_edges_in_both_directions() {
 
     // An entity with no edges at all still yields itself and nothing more.
     let isolated = repo
-        .traverse_graph("no-such-entity", Direction::Downstream, 3)
+        .traverse_graph("no-such-entity", Direction::Downstream, 3, false)
         .await
         .expect("traversal of an unknown root must not error");
     assert_eq!(isolated.node_ids, vec!["no-such-entity".to_string()]);
     assert!(isolated.edges.is_empty());
     assert_eq!(isolated.depth_reached, 0);
+}
+
+/// `PART_OF` edges point at the sample's OTel trace id, not at an entity.
+///
+/// Every entity has one, so if traversal followed them by default every walk
+/// would pick up the same unlabelled dead-end node. This pins the exclusion —
+/// and pins that opting in still works and reports the unresolvable node rather
+/// than dropping it silently.
+#[tokio::test]
+async fn test_structural_part_of_edges_are_excluded_by_default() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let metadata = seed_graph(&repo, "hash-str-001", "tgt-str", "openai_chat_completions.log").await;
+
+    // Confirm the fixture actually exercises the case.
+    let part_of: Vec<_> = metadata
+        .relations
+        .iter()
+        .filter(|r| format!("{:?}", r.relation_type) == "PartOf")
+        .collect();
+    assert!(
+        !part_of.is_empty(),
+        "fixture must produce PART_OF edges for this test to mean anything"
+    );
+    let trace_id = &metadata.otel_trace_id;
+    assert!(
+        part_of.iter().all(|r| &r.target_entity_id == trace_id),
+        "PART_OF targets should be the sample's trace id"
+    );
+
+    let root = &metadata.entities.first().expect("need an entity").entity_id;
+
+    // Default: the trace pseudo-node must not appear at all.
+    let excluded = repo
+        .traverse_graph(root, Direction::Downstream, 3, false)
+        .await
+        .expect("traversal excluding structural edges");
+    assert!(
+        !excluded.node_ids.contains(trace_id),
+        "trace pseudo-node must not be visited by default, got {:?}",
+        excluded.node_ids,
+    );
+    assert!(
+        excluded.unresolved_node_ids.is_empty(),
+        "every visited node should hydrate when structural edges are excluded, unresolved: {:?}",
+        excluded.unresolved_node_ids,
+    );
+
+    // Opted in: the node appears, and is reported as unresolvable rather than
+    // silently missing from `entities`.
+    let included = repo
+        .traverse_graph(root, Direction::Downstream, 3, true)
+        .await
+        .expect("traversal including structural edges");
+    assert!(
+        included.node_ids.contains(trace_id),
+        "trace pseudo-node must be visited when explicitly requested"
+    );
+    assert!(
+        included.unresolved_node_ids.contains(trace_id),
+        "the trace has no entity record, so it must be reported as unresolved"
+    );
+    assert!(
+        included.node_ids.len() > excluded.node_ids.len(),
+        "including structural edges must widen the walk"
+    );
 }
 
 /// `graph_path` must find a real path, distinguish an unreachable pair from a
@@ -435,8 +522,8 @@ async fn test_graph_path_resolves_and_reports_absence() {
         .await
         .expect("connect");
 
-    let metadata = seed_graph(&repo, "hash-pth-001", "tgt-pth", "mcp_session.log").await;
-    let edge = metadata.relations.first().expect("need a relation");
+    let metadata = seed_graph(&repo, "hash-pth-001", "tgt-pth", "openai_chat_completions.log").await;
+    let edge = first_entity_to_entity_edge(&metadata);
 
     match repo
         .graph_path(&edge.source_entity_id, &edge.target_entity_id, 6)

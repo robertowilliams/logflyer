@@ -15,6 +15,7 @@ use tracing::warn;
 
 use super::graph_query::{
     shortest_path, Direction, EdgeEndpoints, PathHop, Traversal, MAX_EDGES,
+    STRUCTURAL_RELATION_TYPES,
 };
 use crate::config::{ConfigHistoryConfig, MongoConfig};
 use crate::config_history;
@@ -1348,9 +1349,28 @@ impl MongoRepository {
         root: &str,
         direction: Direction,
         depth: u32,
+        include_structural: bool,
     ) -> Result<TraversalResult, AppError> {
-        let walk = self.walk_edges(root, direction, depth).await?;
+        let walk = self
+            .walk_edges(root, direction, depth, include_structural)
+            .await?;
         let entities = self.fetch_entities_by_ids(&walk.node_ids).await?;
+
+        // Surface nodes that did not resolve to an entity record rather than
+        // letting them vanish. With structural edges included this is expected
+        // (the trace pseudo-node); without them it means a dangling edge, and
+        // silently dropping it would leave the caller wondering why the graph
+        // has fewer labels than nodes.
+        let resolved: HashSet<&str> = entities
+            .iter()
+            .filter_map(|e| e.get("entity_id").and_then(JsonValue::as_str))
+            .collect();
+        let unresolved_node_ids: Vec<String> = walk
+            .node_ids
+            .iter()
+            .filter(|id| !resolved.contains(id.as_str()))
+            .cloned()
+            .collect();
 
         Ok(TraversalResult {
             root: walk.root,
@@ -1359,6 +1379,7 @@ impl MongoRepository {
             edges: walk.edges,
             entities,
             node_ids: walk.node_ids,
+            unresolved_node_ids,
             truncated: walk.truncated,
         })
     }
@@ -1376,6 +1397,7 @@ impl MongoRepository {
         root: &str,
         direction: Direction,
         depth: u32,
+        include_structural: bool,
     ) -> Result<EdgeWalk, AppError> {
         let root = strip_entity_uri(root);
         let col = self
@@ -1389,7 +1411,16 @@ impl MongoRepository {
 
         while !traversal.is_done() {
             let frontier: Vec<&str> = traversal.frontier().iter().map(String::as_str).collect();
-            let filter = doc! { direction.match_field(): { "$in": &frontier } };
+            let mut filter = doc! { direction.match_field(): { "$in": &frontier } };
+            if !include_structural {
+                // See STRUCTURAL_RELATION_TYPES: these point at the trace, not
+                // at an entity, so following them adds an unlabelled dead end to
+                // every walk.
+                filter.insert(
+                    "relation_type",
+                    doc! { "$nin": STRUCTURAL_RELATION_TYPES },
+                );
+            }
 
             // Cap the per-level fetch. Without this a single hub entity with a
             // huge fan-out would be fully materialised as JSON before the
@@ -1475,8 +1506,10 @@ impl MongoRepository {
 
         // Collect the reachable neighbourhood's edges. Entity records are not
         // hydrated here — only the nodes on the winning path need them.
+        // Structural edges are excluded: the trace pseudo-node is a sink, so it
+        // can never lie on a path, and fetching those edges is pure waste.
         let reachable = self
-            .walk_edges(from, Direction::Downstream, max_depth)
+            .walk_edges(from, Direction::Downstream, max_depth, false)
             .await?;
 
         let endpoints: Vec<EdgeEndpoints> = reachable
@@ -1592,6 +1625,9 @@ pub struct TraversalResult {
     pub edges: Vec<JsonValue>,
     pub entities: Vec<JsonValue>,
     pub node_ids: Vec<String>,
+    /// Visited ids with no corresponding entity record. Normally empty; non-empty
+    /// means either a structural edge was followed or an edge is dangling.
+    pub unresolved_node_ids: Vec<String>,
     pub truncated: bool,
 }
 

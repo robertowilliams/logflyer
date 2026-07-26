@@ -38,6 +38,14 @@ pub struct TraverseQuery {
     /// Hops to walk. Clamped to `1..=MAX_DEPTH`; defaults to 2.
     #[serde(default = "default_depth")]
     depth: u32,
+    /// Include `PART_OF` edges, whose target is the sample's OTel trace id
+    /// rather than an entity.
+    ///
+    /// Off by default: every entity has one, so including them adds the same
+    /// unlabelled dead-end node to every traversal and tells the caller nothing
+    /// the sample's `otel_trace_id` does not already.
+    #[serde(default)]
+    include_structural: bool,
 }
 
 fn default_depth() -> u32 {
@@ -65,7 +73,7 @@ pub async fn downstream(
     Path(entity_id): Path<String>,
     Query(q): Query<TraverseQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    traverse(s, entity_id, Direction::Downstream, q.depth).await
+    traverse(s, entity_id, Direction::Downstream, q).await
 }
 
 /// `GET /api/v1/graph/upstream/:entity_id?depth=N`
@@ -74,16 +82,20 @@ pub async fn upstream(
     Path(entity_id): Path<String>,
     Query(q): Query<TraverseQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    traverse(s, entity_id, Direction::Upstream, q.depth).await
+    traverse(s, entity_id, Direction::Upstream, q).await
 }
 
 async fn traverse(
     s: SharedState,
     entity_id: String,
     direction: Direction,
-    depth: u32,
+    q: TraverseQuery,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match s.repo.traverse_graph(&entity_id, direction, depth).await {
+    match s
+        .repo
+        .traverse_graph(&entity_id, direction, q.depth, q.include_structural)
+        .await
+    {
         Ok(result) => Ok(Json(json!({
             "root":          result.root,
             "direction":     result.direction,
@@ -93,6 +105,10 @@ async fn traverse(
             "node_ids":      result.node_ids,
             "node_count":    result.node_ids.len(),
             "edge_count":    result.edges.len(),
+            // Normally empty. Non-empty means a visited node had no entity
+            // record — expected for the trace pseudo-node when
+            // include_structural=true, otherwise a dangling edge.
+            "unresolved_node_ids": result.unresolved_node_ids,
             "truncated":     result.truncated,
         }))),
         Err(e) => Err((

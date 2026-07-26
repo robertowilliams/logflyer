@@ -256,6 +256,9 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
           node_ids:      res.node_ids,
           node_count:    res.node_ids.length,
           edge_count:    res.edges.length,
+          // A path's nodes are hydrated by definition — the server only returns
+          // entities for the hops it resolved.
+          unresolved_node_ids: [],
           truncated:     res.truncated,
         }
       } else if (res.truncated) {

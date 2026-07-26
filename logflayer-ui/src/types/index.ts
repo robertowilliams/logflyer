@@ -268,6 +268,9 @@ export interface GraphTraversal {
   node_ids:      string[]
   node_count:    number
   edge_count:    number
+  /** Visited ids with no entity record behind them. Normally empty — non-empty
+   *  means an edge points somewhere that is not an entity. */
+  unresolved_node_ids: string[]
   /** True when the server's node budget stopped the walk early. */
   truncated:     boolean
 }
