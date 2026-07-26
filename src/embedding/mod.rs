@@ -43,7 +43,11 @@ use mongodb::bson::DateTime;
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 /// Distinguishes the two embedding namespaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Copy` because it is a fieldless two-variant tag that gets threaded through
+/// several call layers (handler → repository → collection name); making callers
+/// clone it added noise for no safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingKind {
     /// Dense semantic vector produced by an external embedding model.

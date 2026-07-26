@@ -17,9 +17,12 @@ use super::graph_query::{
     shortest_path, Direction, EdgeEndpoints, PathHop, Traversal, MAX_EDGES,
     STRUCTURAL_RELATION_TYPES,
 };
+use super::vector_query::{rank, Candidate, ScoredHit, MAX_SCAN};
 use crate::config::{ConfigHistoryConfig, MongoConfig};
 use crate::config_history;
+use crate::embedding::EmbeddingKind;
 use crate::error::AppError;
+use crate::output::vector::{BEHAVIORAL_EMBEDDINGS_COLL, CONTENT_EMBEDDINGS_COLL};
 use crate::models::{ClassificationRecord, ClassificationStatus, SampleMetadata, SampleRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1559,6 +1562,139 @@ impl MongoRepository {
         }))
     }
 
+    // ─── Similarity search ────────────────────────────────────────────────────
+
+    /// Fetch a sample's own embedding vector, for search-by-example.
+    ///
+    /// Returns `None` when that sample has no embedding of the requested kind —
+    /// common for `Content`, which needs an API key and is off by default.
+    pub async fn fetch_embedding_vector(
+        &self,
+        sample_hash: &str,
+        kind: EmbeddingKind,
+    ) -> Result<Option<Vec<f32>>, AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>(embedding_collection(kind));
+
+        let opts = FindOneOptions::builder()
+            .projection(doc! { "vector": 1 })
+            .build();
+
+        let Some(doc) = col
+            .find_one(doc! { "sample_hash": sample_hash }, opts)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(doc.get_array("vector").ok().map(|arr| {
+            arr.iter()
+                // Vectors are written as f32 but BSON has no f32 — the driver
+                // stores them as doubles, so read as f64 and narrow back.
+                .filter_map(|b| b.as_f64().map(|f| f as f32))
+                .collect()
+        }))
+    }
+
+    /// Rank stored embeddings of `kind` against `query` by cosine similarity.
+    ///
+    /// Scans and scores in process rather than using `$vectorSearch`: that
+    /// operator needs a vector index only MongoDB Atlas provides, and a
+    /// self-hosted standalone `mongod` — what the dev stack runs — cannot serve
+    /// it. Embeddings are one record per sample, so the collection is small
+    /// relative to the raw data; [`MAX_SCAN`] bounds it anyway.
+    ///
+    /// `exclude_sample_hash` drops the query's own sample, which otherwise always
+    /// ranks first at `1.0` and crowds out the answer the caller wanted.
+    ///
+    /// [`MAX_SCAN`]: super::vector_query::MAX_SCAN
+    pub async fn search_embeddings(
+        &self,
+        kind: EmbeddingKind,
+        query: &[f32],
+        limit: usize,
+        target_id: Option<&str>,
+        exclude_sample_hash: Option<&str>,
+    ) -> Result<SearchResult, AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>(embedding_collection(kind));
+
+        let mut filter = Document::new();
+        if let Some(hash) = exclude_sample_hash {
+            filter.insert("sample_hash", doc! { "$ne": hash });
+        }
+        // Embedding records carry no target_id, so narrowing by target means
+        // resolving that target's sample hashes first.
+        if let Some(tid) = target_id {
+            let hashes = self.sample_hashes_for_target(tid).await?;
+            if hashes.is_empty() {
+                return Ok(SearchResult {
+                    hits: Vec::new(),
+                    scored: 0,
+                    skipped: 0,
+                    truncated: false,
+                });
+            }
+            filter.insert("sample_hash", doc! { "$in": hashes });
+        }
+
+        let opts = FindOptions::builder()
+            .projection(doc! { "sample_hash": 1, "embedding_id": 1, "model": 1, "vector": 1 })
+            .limit(MAX_SCAN as i64)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut candidates: Vec<Candidate> = Vec::new();
+        while cursor.advance().await? {
+            let doc = cursor.deserialize_current()?;
+            let Ok(vector_arr) = doc.get_array("vector") else {
+                continue;
+            };
+            candidates.push(Candidate {
+                sample_hash: doc.get_str("sample_hash").unwrap_or_default().to_string(),
+                embedding_id: doc.get_str("embedding_id").unwrap_or_default().to_string(),
+                model: doc.get_str("model").unwrap_or_default().to_string(),
+                vector: vector_arr
+                    .iter()
+                    .filter_map(|b| b.as_f64().map(|f| f as f32))
+                    .collect(),
+            });
+        }
+
+        // A full page means the collection is larger than the scan budget, so
+        // the ranking is over a subset.
+        let truncated = candidates.len() >= MAX_SCAN;
+        let ranking = rank(query, &candidates, limit);
+
+        Ok(SearchResult {
+            hits: ranking.hits,
+            scored: ranking.scored,
+            skipped: ranking.skipped,
+            truncated,
+        })
+    }
+
+    /// Sample hashes belonging to `target_id`, for filtering embeddings.
+    async fn sample_hashes_for_target(&self, target_id: &str) -> Result<Vec<String>, AppError> {
+        let col = self
+            .destination_database
+            .collection::<Document>("sample_metadata");
+        let opts = FindOptions::builder()
+            .projection(doc! { "sample_hash": 1, "_id": 0 })
+            .build();
+
+        let mut cursor = col.find(doc! { "target_id": target_id }, opts).await?;
+        let mut hashes = Vec::new();
+        while cursor.advance().await? {
+            if let Ok(hash) = cursor.deserialize_current()?.get_str("sample_hash") {
+                hashes.push(hash.to_string());
+            }
+        }
+        Ok(hashes)
+    }
+
     /// Create the multikey index backing `entities.entity_id` lookups.
     ///
     /// Without it, every entity lookup is a full collection scan of
@@ -1652,6 +1788,28 @@ pub enum PathOutcome {
     NotFound,
     /// Search hit a budget, so no conclusion about reachability is possible.
     Truncated,
+}
+
+/// Result of [`MongoRepository::search_embeddings`].
+#[derive(Debug, Serialize)]
+pub struct SearchResult {
+    pub hits: Vec<ScoredHit>,
+    /// Candidates that had a comparable vector.
+    pub scored: usize,
+    /// Candidates skipped as incomparable — `scored == 0` with `skipped > 0`
+    /// means the query's dimensionality did not match the collection's.
+    pub skipped: usize,
+    /// True when the collection exceeded the scan budget, so the ranking covers
+    /// only a subset.
+    pub truncated: bool,
+}
+
+/// Which collection holds embeddings of a given kind.
+fn embedding_collection(kind: EmbeddingKind) -> &'static str {
+    match kind {
+        EmbeddingKind::Content => CONTENT_EMBEDDINGS_COLL,
+        EmbeddingKind::Behavioral => BEHAVIORAL_EMBEDDINGS_COLL,
+    }
 }
 
 /// A resolved path between two entities.
