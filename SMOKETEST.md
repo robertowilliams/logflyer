@@ -57,7 +57,7 @@ cargo run -- smoketest tests/fixtures/react_agent.log
 ┌─ Smoke test ──────────────────────────────────────────────────
 │ fixture     : tests/fixtures/mcp_session.log
 │ target_id   : smoketest
-│ content_len : ~800 bytes / 17 lines
+│ content_len : 2902 bytes / 19 lines
 ├─ Wiring snapshot ─────────────────────────────────────────────
 │ entity_extraction_enabled = true
 │ min_entities_for_persist  = 1
@@ -65,14 +65,14 @@ cargo run -- smoketest tests/fixtures/react_agent.log
 │ vector_writer_enabled     = true
 │ embedding_enabled         = false
 ├─ Pipeline result ─────────────────────────────────────────────
-│ sample_hash       = <sha256>
+│ sample_hash       = 9cf60df0…4e5b04
 │ sample_was_new    = true
-│ entities          = 17     (every line is an McpEvent)
-│ relations         = N      (request ↔ response edges)
+│ entities          = 19     (every line is an McpEvent)
+│ relations         = 27     (19 PART_OF + 8 RESPONDED_TO)
 ├─ Auxiliary collections (filtered by sample_hash) ─────────────
-│ entity_edges      = N
-│ prov_relations    = >N     (entity attribution + relation triples)
-│ otel_spans        = 17
+│ entity_edges      = 27
+│ prov_relations    = 46     (entity attribution + relation triples)
+│ otel_spans        = 19
 │ embeddings (c+b)  = 1      (behavioral only, content skipped)
 └───────────────────────────────────────────────────────────────
 ```
@@ -80,6 +80,38 @@ cargo run -- smoketest tests/fixtures/react_agent.log
 If a row is unexpectedly zero, the subcommand prints a diagnostic note
 explaining the most likely cause (e.g. `GRAPH_WRITER_ENABLED=false`,
 `entities < min_entities_for_persist`, etc.).
+
+### All fixtures, verified July 25 2026
+
+| Fixture                     | entities | relations | prov | spans | embeds |
+| --------------------------- | -------- | --------- | ---- | ----- | ------ |
+| `mcp_session.log`           | 19       | 27        | 46   | 19    | 1      |
+| `langchain_json.log`        | 16       | 33        | 41   | 16    | 1      |
+| `crewai_logfmt.log`         | 8        | 16        | 21   | 8     | 1      |
+| `openai_chat_completions.log` | 7      | 16        | 22   | 7     | 1      |
+| `react_agent.log`           | 9        | 23        | 26   | 9     | 1      |
+| `bedrock_multiline.log`     | 5        | 13        | 18   | 5     | 1      |
+| `nginx_access.log`          | 0        | 0         | 0    | 0     | 0      |
+
+`nginx_access.log` yielding zero is correct — it is a non-agentic access log
+and exists to prove the pipeline does *not* invent entities for one.
+
+### Span status and timestamp coverage
+
+Both depend on what the log actually contains, so "not all spans" is usually
+the right answer rather than a bug:
+
+| Fixture                     | spans with a timestamp | notes                                    |
+| --------------------------- | ---------------------- | ---------------------------------------- |
+| `openai_chat_completions.log` | 7/7                  | one `OK` span from `choices[0].finish_reason`; 2 have real durations |
+| `langchain_json.log`        | 16/16                  | `time` field                             |
+| `crewai_logfmt.log`         | 8/8                    | logfmt `time=`                           |
+| `bedrock_multiline.log`     | 3/5                    | leading `2026-04-26 10:00:02`; continuation lines have none; 1 `ERROR` from plain-text severity |
+| `react_agent.log`           | 1/9                    | only the bracketed header lines carry one; `Thought:` / `Action:` lines do not |
+| `mcp_session.log`           | 0/19                   | raw JSON-RPC has no timestamp field at all; 1 `ERROR` from the JSON-RPC error envelope |
+
+A span with no timestamp gets `start_time_unix_nano = 0` and sorts first in the
+waterfall. That is a property of the input, not a pipeline failure.
 
 ## 3. Verify via MongoDB
 
@@ -132,6 +164,41 @@ curl "http://localhost:8080/api/v1/prov?sample_hash=$SAMPLE_HASH"      | jq
 curl "http://localhost:8080/api/v1/spans?sample_hash=$SAMPLE_HASH"     | jq
 ```
 
+### Entity lookup and graph traversal
+
+```bash
+# Grab a real entity id from an entity-to-entity edge. Do NOT use the first
+# relation blindly — relations[0] is a PART_OF edge whose target is the sample's
+# OTel trace id, not an entity.
+read CHILD PARENT <<<"$(curl -s \
+  "http://localhost:8080/api/v1/relations?sample_hash=$SAMPLE_HASH&relation_type=RESPONDED_TO&limit=1" \
+  | jq -r '.records[0] | "\(.source_entity_id) \(.target_entity_id)"')"
+
+# Both id spellings resolve; an unknown id is a 404.
+curl "http://localhost:8080/api/v1/entities/$CHILD"              | jq '.entity.entity_type'
+curl "http://localhost:8080/api/v1/entities/ug%3Aentity%3A$CHILD" | jq '.entity.entity_id'
+
+# RESPONDED_TO runs child -> parent, so walk downstream from the child.
+curl "http://localhost:8080/api/v1/graph/downstream/$CHILD?depth=2" | jq \
+  '{node_count, edge_count, depth_reached, truncated, unresolved_node_ids}'
+curl "http://localhost:8080/api/v1/graph/upstream/$PARENT?depth=2"  | jq '.node_count'
+
+# Directed: child -> parent resolves, the reverse does not.
+curl "http://localhost:8080/api/v1/graph/path?from=$CHILD&to=$PARENT" | jq '{found, hop_count}'
+curl "http://localhost:8080/api/v1/graph/path?from=$PARENT&to=$CHILD" | jq '{found, truncated}'
+```
+
+Two things to know about traversal:
+
+- **`PART_OF` edges are excluded by default.** Their `target_entity_id` holds the
+  sample's OTel trace id rather than an `entity_id`, and every entity has one, so
+  following them would add the same unlabelled dead-end node to every walk. Pass
+  `include_structural=true` to opt in; the trace then shows up in
+  `unresolved_node_ids`, because it has no entity record to hydrate.
+- **`found: false` and `truncated: true` are different answers.** The first means
+  the search finished and there is no path; the second means it hit a size limit
+  and stopped, so the pair may still be connected.
+
 ## 5. Verify via UI
 
 ```bash
@@ -145,13 +212,21 @@ smoke-test sample appears in each:
 - **Entities** — table fills with `McpEvent` rows; `semantic_role` shows
   `mcp_request` / `mcp_response`; tool names (`web_search`, `calculator`,
   `read_file`) appear in the Tool / MCP column.
-- **Relations** — table shows `TRIGGERED_BY` / `RESPONDED_TO` edges with
-  source and target entities resolved by name.
+- **Relations** — table shows `PART_OF` / `RESPONDED_TO` edges with source and
+  target entities resolved by name. The force graph below it should be
+  *connected*, not a scatter of isolated nodes. Double-click a node for
+  Upstream / Downstream traversal; the toolbar's route button starts a
+  two-click shortest-path pick.
 - **PROV** — triples render with `wasGeneratedBy` / `wasDerivedFrom` /
   `wasAttributedTo` predicates. Subjects/objects strip the `ug:entity:`
-  URI prefix so labels resolve.
-- **Spans** — waterfall shows `CLIENT`-kind bars for tool calls; status
-  badges show `UNSET` (or `OK` once Phase F lands real timestamps).
+  URI prefix so labels resolve. References to entities outside the loaded
+  sample resolve through `/api/v1/entities/:id` rather than showing `?`.
+- **Spans** — waterfall shows `CLIENT`-kind bars for tool calls. Status badges
+  should include at least one non-`UNSET` value on `mcp_session.log` (an
+  `ERROR` from the JSON-RPC error envelope) and on
+  `openai_chat_completions.log` (an `OK` from `finish_reason`). Bars reflect
+  real durations wherever the log carried a timestamp — see the coverage table
+  above for which fixtures do.
 
 ## Common failures
 
@@ -164,6 +239,9 @@ smoke-test sample appears in each:
 | `content_embeddings = 0`, behavioral = 1    | `EMBEDDING_ENABLED=false` or missing `EMBEDDING_API_KEY`        |
 | API returns 500 on `/api/v1/relations`      | `entity_edges` collection missing — re-run with graph writer on |
 | UI views show empty state                   | Sample inserted before frontend store loaded — refresh the page |
+| Traversal returns an unlabelled node        | An edge points at something with no entity record; check `unresolved_node_ids` |
+| Graph view is all isolated nodes            | Sample produced only `PART_OF` edges — no relation rule matched its shape |
+| All spans `UNSET` with zero timestamps      | Log has no timestamp field and no leading timestamp in the line (e.g. raw JSON-RPC) |
 
 ## Re-running
 
