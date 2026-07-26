@@ -188,6 +188,44 @@ curl "http://localhost:8080/api/v1/graph/path?from=$CHILD&to=$PARENT" | jq '{fou
 curl "http://localhost:8080/api/v1/graph/path?from=$PARENT&to=$CHILD" | jq '{found, truncated}'
 ```
 
+### Vector search
+
+Embeddings are keyed per **sample**, so this finds similar *samples* — the
+behavioural-clustering question, not "which log line resembles this line".
+
+```bash
+# Search by example: a sample's own vector, minus itself.
+curl -s -X POST http://localhost:8080/api/v1/search \
+  -H 'Content-Type: application/json' \
+  -d "{\"sample_hash\":\"$SAMPLE_HASH\",\"kind\":\"behavioral\",\"limit\":5}" | jq
+
+# include_self:true puts the query sample back in — it scores exactly 1.0, which
+# is the quickest way to confirm the endpoint is scoring correctly.
+curl -s -X POST http://localhost:8080/api/v1/search \
+  -H 'Content-Type: application/json' \
+  -d "{\"sample_hash\":\"$SAMPLE_HASH\",\"include_self\":true,\"limit\":3}" \
+  | jq '.hits[] | {score, sample_hash}'
+```
+
+Expected on the bundled fixtures: the two MCP samples score ~0.97 against each
+other, and structurally different agent runs (langchain, crewai) sit near 0.43.
+That gap is the endpoint working — pure-MCP sessions cluster, mixed
+agent/tool/completion runs do not.
+
+`kind` defaults to `behavioral`. Asking for `content` returns **400** unless
+`EMBEDDING_ENABLED=true` and an API key are set, because that collection is
+otherwise empty — the error says so rather than returning zero hits.
+
+**Reading `scored` / `skipped`.** `skipped` counts candidates whose vector could
+not be compared, which in practice means a dimensionality mismatch — behavioral
+vectors are 36-dimensional, content 1536. So:
+
+| Result | Meaning |
+| ------ | ------- |
+| `scored > 0`, `hits` empty | nothing is similar |
+| `scored: 0`, `skipped > 0` | your query vector is the wrong size |
+| `scored: 0`, `skipped: 0`  | the filter matched no samples at all |
+
 Two things to know about traversal:
 
 - **`PART_OF` edges are excluded by default.** Their `target_entity_id` holds the

@@ -21,6 +21,7 @@ pub mod logs;
 pub mod metadata;
 pub mod prov;
 pub mod relations;
+pub mod search;
 pub mod samples;
 pub mod spans;
 pub mod targets;
@@ -75,6 +76,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/graph/path",                  get(graph::path))
         .route("/api/v1/graph/downstream/:entity_id", get(graph::downstream))
         .route("/api/v1/graph/upstream/:entity_id",   get(graph::upstream))
+        // ── Vector search ─────────────────────────────────────────────────────
+        // POST rather than GET: a query vector is 36 or 1536 floats, which does
+        // not belong in a URL.
+        .route("/api/v1/search", post(search::search))
         .route("/api/v1/admin/settings",                  get(admin::get_settings).put(admin::put_settings))
         .route("/api/v1/admin/settings/history",          get(admin::get_settings_history))
         .route("/api/v1/admin/settings/restore/:version", post(admin::post_settings_restore))

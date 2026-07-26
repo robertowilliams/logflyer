@@ -23,7 +23,10 @@ use std::path::Path;
 
 use logflayer::config::{MongoConfig, PreprocessingConfig};
 use logflayer::models::{ClassificationStatus, ProcessingStatus, SampleMetadata, SampleRecord};
+use logflayer::config::EmbeddingConfig;
+use logflayer::embedding::{EmbeddingKind, EmbeddingWorker};
 use logflayer::output::graph::GraphWriter;
+use logflayer::output::vector::VectorWriter;
 use logflayer::preprocessing::Preprocessor;
 use logflayer::repository::{Direction, MongoRepository, PathOutcome, StoreOutcome};
 use logflayer::sampling::SamplingMode;
@@ -271,6 +274,49 @@ fn first_entity_to_entity_edge(metadata: &SampleMetadata) -> &logflayer::models:
         .iter()
         .find(|r| format!("{:?}", r.relation_type) != "PartOf")
         .expect("fixture must produce at least one entity-to-entity relation")
+}
+
+/// Seed a sample's metadata and its behavioral embedding; return the sample hash.
+///
+/// Content embeddings are deliberately not seeded — they need an API call, which
+/// is exactly the condition the search endpoint has to handle gracefully.
+async fn seed_embeddings(
+    repo: &MongoRepository,
+    hash: &str,
+    target: &str,
+    fixture_name: &str,
+) -> String {
+    let content = fixture(fixture_name);
+    let metadata = preprocess(hash, target, &content);
+    repo.store_metadata(&metadata).await.expect("store metadata");
+
+    // Behavioral vectors are computed locally, so no embedding API is involved.
+    let bundle = EmbeddingWorker::new(EmbeddingConfig {
+        enabled: false,
+        api_key: String::new(),
+        api_base_url: String::new(),
+        model: "text-embedding-3-small".to_string(),
+        max_text_chars: 8_000,
+        dimensions: 1536,
+    })
+    .expect("build embedding worker")
+    // `enabled: false` means the content vector is skipped without an API call;
+    // the behavioral vector is computed locally and always returned.
+    .embed_sample(
+        hash,
+        &content,
+        &metadata.entities,
+        &metadata.relations,
+        metadata.agentic_scan.signal_score,
+    )
+    .await;
+
+    VectorWriter::new(repo.destination_db())
+        .write(&bundle.into_records("text-embedding-3-small"))
+        .await
+        .expect("write embeddings");
+
+    hash.to_string()
 }
 
 /// Seed a sample's metadata plus its edges, and return the stored metadata.
@@ -580,6 +626,150 @@ async fn test_graph_path_resolves_and_reports_absence() {
     assert!(
         repo.graph_path("", &edge.target_entity_id, 6).await.is_err(),
         "empty `from` is a caller error, not an empty result"
+    );
+}
+
+// ─── Similarity search ────────────────────────────────────────────────────────
+
+/// `search_embeddings` must rank a sample's own vector first at 1.0, honour the
+/// self-exclusion, and report a dimensionality mismatch as skipped rather than as
+/// a poor match.
+#[tokio::test]
+async fn test_search_embeddings_ranks_self_first_and_reports_mismatches() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    // Two structurally different samples, so their behavioral vectors differ.
+    let a = seed_embeddings(&repo, "hash-emb-001", "tgt-emb", "mcp_session.log").await;
+    let _b = seed_embeddings(&repo, "hash-emb-002", "tgt-emb", "openai_chat_completions.log").await;
+
+    let query = repo
+        .fetch_embedding_vector(&a, EmbeddingKind::Behavioral)
+        .await
+        .expect("fetch vector")
+        .expect("seeded sample must have a behavioral embedding");
+    assert_eq!(query.len(), 36, "behavioral vectors are 36-dimensional");
+
+    // Including self, the query's own sample must top the ranking at 1.0.
+    let with_self = repo
+        .search_embeddings(EmbeddingKind::Behavioral, &query, 10, None, None)
+        .await
+        .expect("search");
+    assert_eq!(with_self.hits[0].sample_hash, a);
+    assert!(
+        (with_self.hits[0].score - 1.0).abs() < 1e-5,
+        "a vector against itself must score 1.0, got {}",
+        with_self.hits[0].score,
+    );
+    assert_eq!(with_self.skipped, 0);
+    assert!(!with_self.truncated);
+
+    // Excluding self, it must be gone entirely.
+    let without_self = repo
+        .search_embeddings(EmbeddingKind::Behavioral, &query, 10, None, Some(&a))
+        .await
+        .expect("search excluding self");
+    assert!(
+        without_self.hits.iter().all(|h| h.sample_hash != a),
+        "excluded sample leaked into the results",
+    );
+    assert_eq!(
+        without_self.hits.len(),
+        with_self.hits.len() - 1,
+        "exactly one hit should disappear",
+    );
+
+    // A wrong-sized query is a caller error, not a set of bad matches: nothing
+    // scores, everything is skipped.
+    let mismatched = repo
+        .search_embeddings(EmbeddingKind::Behavioral, &[1.0; 5], 10, None, None)
+        .await
+        .expect("search with wrong dimensionality");
+    assert!(mismatched.hits.is_empty());
+    assert_eq!(mismatched.scored, 0);
+    assert!(mismatched.skipped > 0, "candidates must be counted as skipped");
+}
+
+/// The `target_id` filter must scope results, and an unknown target must yield a
+/// definite empty answer rather than an unfiltered one.
+#[tokio::test]
+async fn test_search_embeddings_scopes_by_target() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let mine = seed_embeddings(&repo, "hash-emb-010", "tgt-mine", "mcp_session.log").await;
+    let theirs = seed_embeddings(&repo, "hash-emb-011", "tgt-theirs", "mcp_session.log").await;
+
+    let query = repo
+        .fetch_embedding_vector(&mine, EmbeddingKind::Behavioral)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let scoped = repo
+        .search_embeddings(EmbeddingKind::Behavioral, &query, 10, Some("tgt-mine"), None)
+        .await
+        .expect("scoped search");
+    assert!(
+        scoped.hits.iter().all(|h| h.sample_hash != theirs),
+        "the other target's sample must not appear",
+    );
+    assert!(scoped.hits.iter().any(|h| h.sample_hash == mine));
+
+    // Unknown target: empty, and distinguishable from a dimensionality problem
+    // because nothing was skipped either.
+    let none = repo
+        .search_embeddings(EmbeddingKind::Behavioral, &query, 10, Some("tgt-nope"), None)
+        .await
+        .expect("search on unknown target");
+    assert!(none.hits.is_empty());
+    assert_eq!(none.scored, 0);
+    assert_eq!(none.skipped, 0);
+}
+
+/// Content embeddings are off by default, so asking for one must be a clean
+/// `None` rather than an error — the handler turns that into a 400 explaining why.
+#[tokio::test]
+async fn test_fetch_content_embedding_is_none_when_disabled() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let hash = seed_embeddings(&repo, "hash-emb-020", "tgt-emb", "mcp_session.log").await;
+
+    assert!(
+        repo.fetch_embedding_vector(&hash, EmbeddingKind::Behavioral)
+            .await
+            .unwrap()
+            .is_some(),
+        "behavioral embeddings need no API key and must be present",
+    );
+    assert!(
+        repo.fetch_embedding_vector(&hash, EmbeddingKind::Content)
+            .await
+            .unwrap()
+            .is_none(),
+        "content embeddings require an API key; absence must not be an error",
+    );
+    assert!(
+        repo.fetch_embedding_vector("no-such-sample", EmbeddingKind::Behavioral)
+            .await
+            .unwrap()
+            .is_none(),
     );
 }
 
