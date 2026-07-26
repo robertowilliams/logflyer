@@ -347,15 +347,15 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
    *  `otel_builder::span_kind` in the Rust backend. */
   function entityTypeToSpanKind(et: EntityType): SpanKind {
     switch (et) {
-      case 'PromptEvent':                                    return 'PRODUCER'
-      case 'CompletionEvent':
-      case 'ToolResultEvent':                                return 'CONSUMER'
-      case 'ToolCallEvent':
-      case 'RetrievalEvent':
-      case 'McpEvent':                                       return 'CLIENT'
-      case 'AgentStep':
-      case 'ContextWindow':
-      case 'Unknown':
+      case 'prompt_event':                                   return 'PRODUCER'
+      case 'completion_event':
+      case 'tool_result_event':                              return 'CONSUMER'
+      case 'tool_call_event':
+      case 'retrieval_event':
+      case 'mcp_event':                                       return 'CLIENT'
+      case 'agent_step':
+      case 'context_window':
+      case 'unknown':
       default:                                               return 'INTERNAL'
     }
   }

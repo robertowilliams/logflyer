@@ -164,10 +164,17 @@ export interface Finding {
 // in lockstep with the Rust definitions or the views will silently render
 // wrong colours / blank cells.
 
-/** Backend `models::EntityType` — default serde (PascalCase variant names). */
+/**
+ * Backend `models::EntityType` — `#[serde(rename_all = "snake_case")]`.
+ *
+ * These were previously declared PascalCase, matching the Rust *variant* names
+ * rather than the wire format. Nothing crashed, it just silently never matched:
+ * the Entities type filter selected nothing, every type badge fell through to the
+ * default colour, and `entityTypeToSpanKind` returned `INTERNAL` for everything.
+ */
 export type EntityType =
-  | 'PromptEvent' | 'CompletionEvent' | 'ToolCallEvent' | 'ToolResultEvent'
-  | 'RetrievalEvent' | 'AgentStep' | 'McpEvent' | 'ContextWindow' | 'Unknown'
+  | 'prompt_event' | 'completion_event' | 'tool_call_event' | 'tool_result_event'
+  | 'retrieval_event' | 'agent_step' | 'mcp_event' | 'context_window' | 'unknown'
 
 /** Backend `models::SemanticRole` — `#[serde(rename_all = "snake_case")]`. */
 export type SemanticRole =
@@ -185,7 +192,9 @@ export type RelationType =
   | 'RESPONDED_TO' | 'ASSEMBLED_FROM' | 'PART_OF' | 'DELEGATED_TO'
 
 /** Backend `models::RelationSource` — `#[serde(rename_all = "snake_case")]`. */
-export type RelationSource = 'explicit' | 'parsed'
+/** Backend `models::RelationSource` — `#[serde(rename_all = "snake_case")]`.
+ *  `inferred` is the `#[default]` and the source of most rules; it was missing. */
+export type RelationSource = 'explicit' | 'inferred' | 'parsed'
 
 /** Backend `prov_linker::ProvPredicate` — `#[serde(rename_all = "camelCase")]`. */
 export type ProvPredicate =

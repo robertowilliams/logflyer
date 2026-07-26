@@ -9,7 +9,7 @@
 
       <select v-model="ugStore.filterEntityType" class="input w-44">
         <option value="">All entity types</option>
-        <option v-for="et in ENTITY_TYPES" :key="et" :value="et">{{ et }}</option>
+        <option v-for="et in ENTITY_TYPES" :key="et" :value="et">{{ entityTypeLabel(et) }}</option>
       </select>
 
       <button @click="loadPage(1)" class="btn-primary inline-flex items-center gap-1.5"><RefreshCw :size="14" />Refresh</button>
@@ -204,10 +204,17 @@ const page          = ref(1)
 const limit         = 50
 const selectedEntity = ref<EntityRecord | null>(null)
 
+// snake_case to match the wire format — see the note on `EntityType`. These were
+// PascalCase, so selecting a type filtered everything out.
 const ENTITY_TYPES: EntityType[] = [
-  'PromptEvent', 'CompletionEvent', 'ToolCallEvent', 'ToolResultEvent',
-  'RetrievalEvent', 'AgentStep', 'McpEvent', 'ContextWindow', 'Unknown',
+  'prompt_event', 'completion_event', 'tool_call_event', 'tool_result_event',
+  'retrieval_event', 'agent_step', 'mcp_event', 'context_window', 'unknown',
 ]
+
+/** `prompt_event` → `Prompt Event`, so the dropdown stays readable. */
+function entityTypeLabel(et: string): string {
+  return et.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
+}
 
 function fmt(ts: string) {
   try { return new Date(ts).toLocaleString() } catch { return ts }
@@ -223,15 +230,15 @@ function statusClass(s: string) {
 
 function entityTypeClass(et: string) {
   const map: Record<string, string> = {
-    PromptEvent:     'badge-blue',
-    CompletionEvent: 'badge-green',
-    ToolCallEvent:   'badge-blue',
-    ToolResultEvent: 'badge-green',
-    RetrievalEvent:  'badge-yellow',
-    AgentStep:       'badge-yellow',
-    McpEvent:        'px-2 py-0.5 rounded text-xs bg-purple-500/20 text-purple-300 border border-purple-500/30',
-    ContextWindow:   'badge-slate',
-    Unknown:         'badge-slate',
+    prompt_event:      'badge-blue',
+    completion_event:  'badge-green',
+    tool_call_event:   'badge-blue',
+    tool_result_event: 'badge-green',
+    retrieval_event:   'badge-yellow',
+    agent_step:        'badge-yellow',
+    mcp_event:         'px-2 py-0.5 rounded text-xs bg-purple-500/20 text-purple-300 border border-purple-500/30',
+    context_window:    'badge-slate',
+    unknown:           'badge-slate',
   }
   return map[et] ?? 'badge-slate'
 }
