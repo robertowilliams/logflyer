@@ -22,9 +22,10 @@
 use std::path::Path;
 
 use logflayer::config::{MongoConfig, PreprocessingConfig};
-use logflayer::models::{ClassificationStatus, ProcessingStatus, SampleRecord};
+use logflayer::models::{ClassificationStatus, ProcessingStatus, SampleMetadata, SampleRecord};
+use logflayer::output::graph::GraphWriter;
 use logflayer::preprocessing::Preprocessor;
-use logflayer::repository::{MongoRepository, StoreOutcome};
+use logflayer::repository::{Direction, MongoRepository, PathOutcome, StoreOutcome};
 use logflayer::sampling::SamplingMode;
 use mongodb::bson::DateTime;
 use testcontainers::runners::AsyncRunner;
@@ -49,7 +50,23 @@ fn default_preprocessing_config() -> PreprocessingConfig {
         agentic_threshold: 0.02,
         max_schema_lines: 200,
         metrics_port: 0, // disable metrics HTTP listener in tests
+        // Stages 6–10 on, so these tests exercise entity extraction, relation
+        // linking and the graph/vector outputs rather than only stages 1–5.
+        entity_extraction_enabled: true,
+        // 0 disables the persistence gate: write outputs for any sample with
+        // at least one entity, so fixtures do not need to be large.
+        min_entities_for_persist: 0,
     }
+}
+
+/// Run the pipeline and return just the [`SampleMetadata`].
+///
+/// `Preprocessor::run` returns a [`PipelineOutput`] bundling metadata with the
+/// PROV triples and OTel spans; most tests here only care about the metadata.
+fn preprocess(hash: &str, target: &str, content: &str) -> SampleMetadata {
+    Preprocessor::new(default_preprocessing_config())
+        .run(hash, target, content)
+        .metadata
 }
 
 fn fixture(name: &str) -> String {
@@ -118,8 +135,7 @@ async fn test_store_metadata_upsert_idempotent() {
         .expect("connect");
 
     let content = fixture("langchain_json.log");
-    let metadata = Preprocessor::new(default_preprocessing_config())
-        .run("hash-up-001", "tgt-up", &content);
+    let metadata = preprocess("hash-up-001", "tgt-up", &content);
 
     repo.store_metadata(&metadata).await.expect("first upsert");
     repo.store_metadata(&metadata).await.expect("second upsert must not error");
@@ -159,7 +175,7 @@ async fn test_langchain_sample_lifecycle() {
     );
 
     // Step 2: run preprocessing and store metadata
-    let metadata = Preprocessor::new(default_preprocessing_config()).run(hash, target, &content);
+    let metadata = preprocess(hash, target, &content);
 
     assert!(
         metadata.agentic_scan.worth_classifying,
@@ -206,7 +222,7 @@ async fn test_skip_logic_not_worth_classifying() {
 
     repo.store_sample(target, &sample).await.unwrap();
 
-    let metadata = Preprocessor::new(default_preprocessing_config()).run(hash, target, &content);
+    let metadata = preprocess(hash, target, &content);
 
     assert!(
         !metadata.agentic_scan.worth_classifying || metadata.agentic_scan.signal_score < 0.02,
@@ -228,6 +244,255 @@ async fn test_skip_logic_not_worth_classifying() {
     assert!(
         !unprocessed.iter().any(|s| s.sample_hash == hash),
         "nginx sample must NOT appear in fetch_unprocessed_samples after metadata is stored"
+    );
+}
+
+// ─── Graph traversal ──────────────────────────────────────────────────────────
+//
+// The traversal algorithms are unit-tested in-memory in
+// `repository::graph_query`, so these tests deliberately cover only what those
+// cannot: the actual MongoDB interaction — the positional projection used to
+// pull one entity out of a `sample_metadata.entities` array, the aggregation
+// that hydrates many, and the per-level `$in` queries against `entity_edges`.
+
+/// Seed a sample's metadata plus its edges, and return the stored metadata.
+///
+/// Edges must go through `GraphWriter` rather than being written directly, so
+/// the tests exercise the same serialisation the live pipeline uses.
+async fn seed_graph(repo: &MongoRepository, hash: &str, target: &str, fixture_name: &str) -> SampleMetadata {
+    let content = fixture(fixture_name);
+    let metadata = preprocess(hash, target, &content);
+    repo.store_metadata(&metadata).await.expect("store metadata");
+
+    GraphWriter::new(repo.destination_db())
+        .write_edges(&metadata.relations)
+        .await
+        .expect("write edges");
+
+    metadata
+}
+
+/// A bare id and its `ug:entity:` URI form must resolve to the same record,
+/// and the positional projection must return the *requested* entity rather
+/// than simply the first element of the array.
+#[tokio::test]
+async fn test_fetch_entity_by_id_accepts_both_id_forms() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let metadata = seed_graph(&repo, "hash-ent-001", "tgt-ent", "langchain_json.log").await;
+    assert!(
+        metadata.entities.len() > 1,
+        "fixture must yield several entities so the projection is actually discriminating"
+    );
+
+    // Deliberately not entities[0] — a broken projection would return the first
+    // element and this test would still pass if we asked for it.
+    let wanted = metadata.entities.last().expect("at least one entity");
+
+    let by_id = repo
+        .fetch_entity_by_id(&wanted.entity_id)
+        .await
+        .expect("lookup by bare id")
+        .expect("entity must be found");
+    assert_eq!(
+        by_id.get("entity_id").and_then(|v| v.as_str()),
+        Some(wanted.entity_id.as_str()),
+        "must return the requested entity, not just the first in the array"
+    );
+
+    let by_uri = repo
+        .fetch_entity_by_id(&format!("ug:entity:{}", wanted.entity_id))
+        .await
+        .expect("lookup by PROV URI")
+        .expect("URI form must resolve too");
+    assert_eq!(by_id, by_uri, "both id spellings must resolve identically");
+
+    assert!(
+        repo.fetch_entity_by_id("nonexistent-entity-id").await.unwrap().is_none(),
+        "unknown id must be None, not an error"
+    );
+}
+
+/// The hydration aggregation must return exactly the requested entities —
+/// no extras from the same sample, and missing ids silently omitted.
+#[tokio::test]
+async fn test_fetch_entities_by_ids_returns_only_requested() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let metadata = seed_graph(&repo, "hash-ent-002", "tgt-ent2", "langchain_json.log").await;
+    assert!(metadata.entities.len() >= 2, "need at least two entities");
+
+    let wanted: Vec<String> = metadata
+        .entities
+        .iter()
+        .take(2)
+        .map(|e| e.entity_id.clone())
+        .collect();
+
+    let mut ids = wanted.clone();
+    ids.push("definitely-not-a-real-entity".to_string());
+
+    let fetched = repo.fetch_entities_by_ids(&ids).await.expect("hydrate");
+    assert_eq!(
+        fetched.len(),
+        2,
+        "must return the two real entities and silently skip the missing one"
+    );
+
+    let returned: Vec<&str> = fetched
+        .iter()
+        .filter_map(|e| e.get("entity_id").and_then(|v| v.as_str()))
+        .collect();
+    for id in &wanted {
+        assert!(returned.contains(&id.as_str()), "missing requested entity {id}");
+    }
+
+    assert!(
+        repo.fetch_entities_by_ids(&[]).await.unwrap().is_empty(),
+        "empty input must short-circuit to an empty result"
+    );
+}
+
+/// Walking downstream from the first entity must reach further than depth 1,
+/// and walking upstream from a downstream node must lead back to it.
+#[tokio::test]
+async fn test_traverse_graph_follows_edges_in_both_directions() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let metadata = seed_graph(&repo, "hash-trv-001", "tgt-trv", "mcp_session.log").await;
+    let first_edge = metadata
+        .relations
+        .first()
+        .expect("fixture must produce at least one relation");
+    let root = first_edge.source_entity_id.clone();
+    let neighbour = first_edge.target_entity_id.clone();
+
+    let down = repo
+        .traverse_graph(&root, Direction::Downstream, 3)
+        .await
+        .expect("downstream traversal");
+
+    assert_eq!(down.root, root);
+    assert!(
+        down.node_ids.contains(&neighbour),
+        "depth-3 downstream walk must reach the direct neighbour"
+    );
+    assert!(!down.edges.is_empty(), "must return the edges it walked");
+    assert!(
+        down.entities.iter().any(|e| {
+            e.get("entity_id").and_then(|v| v.as_str()) == Some(root.as_str())
+        }),
+        "traversal must hydrate entity records for visited nodes"
+    );
+    assert!(!down.truncated, "a fixture-sized graph must not hit any budget");
+
+    let up = repo
+        .traverse_graph(&neighbour, Direction::Upstream, 3)
+        .await
+        .expect("upstream traversal");
+    assert!(
+        up.node_ids.contains(&root),
+        "walking upstream from the neighbour must reach the root again"
+    );
+
+    // An entity with no edges at all still yields itself and nothing more.
+    let isolated = repo
+        .traverse_graph("no-such-entity", Direction::Downstream, 3)
+        .await
+        .expect("traversal of an unknown root must not error");
+    assert_eq!(isolated.node_ids, vec!["no-such-entity".to_string()]);
+    assert!(isolated.edges.is_empty());
+    assert_eq!(isolated.depth_reached, 0);
+}
+
+/// `graph_path` must find a real path, distinguish an unreachable pair from a
+/// truncated search, and reject empty input.
+#[tokio::test]
+async fn test_graph_path_resolves_and_reports_absence() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let metadata = seed_graph(&repo, "hash-pth-001", "tgt-pth", "mcp_session.log").await;
+    let edge = metadata.relations.first().expect("need a relation");
+
+    match repo
+        .graph_path(&edge.source_entity_id, &edge.target_entity_id, 6)
+        .await
+        .expect("path lookup")
+    {
+        PathOutcome::Found(path) => {
+            assert_eq!(path.hops.len(), 1, "directly connected pair is one hop");
+            assert_eq!(path.hops[0].relation_id, edge.relation_id);
+            assert_eq!(path.edges.len(), 1, "one edge document per hop");
+            assert!(!path.truncated);
+        }
+        other => panic!("expected a path between two directly-connected entities, got {other:?}"),
+    }
+
+    // Reversed: edges are directed and the walk only follows them outward, so
+    // unless the fixture happens to contain an explicit back edge there is no
+    // path the other way. Assert that concretely rather than accepting any
+    // outcome — a test that admits both answers cannot fail.
+    let has_back_edge = metadata.relations.iter().any(|r| {
+        r.source_entity_id == edge.target_entity_id
+            && r.target_entity_id == edge.source_entity_id
+    });
+    let reversed = repo
+        .graph_path(&edge.target_entity_id, &edge.source_entity_id, 6)
+        .await
+        .expect("reverse path lookup");
+    if has_back_edge {
+        assert!(
+            matches!(reversed, PathOutcome::Found(_)),
+            "fixture contains an explicit back edge, so the reverse path must resolve"
+        );
+    } else {
+        assert!(
+            matches!(reversed, PathOutcome::NotFound),
+            "no back edge exists, so the reverse lookup must be a definite NotFound \
+             (Truncated would mean the budget tripped on a fixture-sized graph)"
+        );
+    }
+
+    // Same entity: zero-length path, and no traversal needed.
+    match repo
+        .graph_path(&edge.source_entity_id, &edge.source_entity_id, 6)
+        .await
+        .expect("self path")
+    {
+        PathOutcome::Found(path) => {
+            assert!(path.hops.is_empty(), "path to self has no hops");
+            assert_eq!(path.node_ids.len(), 1);
+        }
+        other => panic!("path to self must be Found, got {other:?}"),
+    }
+
+    assert!(
+        repo.graph_path("", &edge.target_entity_id, 6).await.is_err(),
+        "empty `from` is a caller error, not an empty result"
     );
 }
 
