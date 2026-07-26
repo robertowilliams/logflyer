@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use mongodb::bson::DateTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
@@ -233,6 +234,8 @@ fn extract_lines(
 
         let token_count = extract_token_count(trimmed, &fields);
         let latency_ms = extract_latency_ms(trimmed, &fields);
+        // Read before `fields` is moved into the record below.
+        let timestamp_utc = extract_timestamp(&fields, trimmed);
 
         entities.push(EntityRecord {
             prov_entity_id: format!("ug:entity:{}", entity_id),
@@ -253,7 +256,7 @@ fn extract_lines(
             mcp_server_id,
             token_count,
             latency_ms,
-            timestamp_utc: None,
+            timestamp_utc,
             content_embedding_id: None,
             behavioral_embedding_id: None,
         });
@@ -410,6 +413,125 @@ fn extract_latency_ms(line: &str, fields: &HashMap<String, Value>) -> Option<u64
         .captures(line)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse().ok())
+}
+
+/// Field names that carry a line's own timestamp.
+///
+/// Mirrors `format_detector::TIMESTAMP_KEYS` — that module detects *which* field
+/// a format uses for schema purposes; this one reads the value out per entity.
+const TIMESTAMP_KEYS: &[&str] = &["timestamp", "time", "ts", "@timestamp", "date", "datetime"];
+
+/// Extract the event's own timestamp from a structured log line.
+///
+/// Without this, `EntityRecord.timestamp_utc` is always `None`, and
+/// `otel_builder::timestamps` — which reads exactly this field — emits
+/// `start_time_unix_nano = 0` for every span, leaving the SpansView waterfall
+/// ordered by entity index rather than by real time.
+///
+/// Accepts the shapes that actually occur across the fixtures:
+///
+/// * RFC 3339 / ISO 8601 strings, with or without a zone
+///   (`2024-01-15T10:00:00Z`, `2026-04-26T10:00:00+02:00`)
+/// * Space-separated ISO-like strings (`2026-04-26 10:00:02`)
+/// * Epoch seconds, milliseconds, or microseconds as a number or a
+///   numeric string — logfmt stringifies everything
+///
+/// Returns `None` when no field is present or nothing parses, which is a
+/// legitimate outcome: raw JSON-RPC (`mcp_session.log`) carries no timestamps
+/// at all.
+fn extract_timestamp(fields: &HashMap<String, Value>, raw: &str) -> Option<DateTime> {
+    for key in TIMESTAMP_KEYS {
+        let Some(value) = fields.get(*key) else { continue };
+        if let Some(dt) = parse_timestamp_value(value) {
+            return Some(dt);
+        }
+    }
+    // Fall back to a leading timestamp in the raw line. Plain-text and multiline
+    // samples produce no key/value pairs at all, so without this their spans all
+    // carry `start_time_unix_nano = 0` and the waterfall reverts to entity order.
+    leading_timestamp(raw)
+}
+
+/// Match a timestamp at the start of an unstructured line.
+///
+/// Covers the two shapes the plain-text fixtures use — bare
+/// (`2026-04-26 10:00:01 INFO …`) and bracketed
+/// (`[2024-01-15 10:00:00] INFO …`) — plus the `T` separator and an optional
+/// zone, so ISO-prefixed lines work too.
+static LEADING_TS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"^\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\]?",
+    )
+    .expect("leading timestamp regex")
+});
+
+fn leading_timestamp(raw: &str) -> Option<DateTime> {
+    let captured = LEADING_TS_RE.captures(raw.trim())?.get(1)?.as_str();
+    parse_timestamp_str(captured)
+}
+
+fn parse_timestamp_value(value: &Value) -> Option<DateTime> {
+    match value {
+        Value::Number(n) => n.as_f64().and_then(epoch_to_datetime),
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            // Try textual forms first: a bare epoch is unambiguous, but
+            // "2024-01-15..." would parse as the number 2024 if attempted early.
+            parse_timestamp_str(s).or_else(|| s.parse::<f64>().ok().and_then(epoch_to_datetime))
+        }
+        _ => None,
+    }
+}
+
+fn parse_timestamp_str(s: &str) -> Option<DateTime> {
+    use chrono::{DateTime as ChronoDateTime, NaiveDateTime, Utc};
+
+    // Offset-aware: RFC 3339 / ISO 8601 with Z or ±HH:MM.
+    if let Ok(dt) = ChronoDateTime::parse_from_rfc3339(s) {
+        return Some(DateTime::from_millis(dt.timestamp_millis()));
+    }
+    // Zone-less variants — assume UTC, which is what these log formats mean.
+    const NAIVE_FORMATS: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ];
+    for fmt in NAIVE_FORMATS {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(DateTime::from_millis(
+                naive.and_utc().timestamp_millis(),
+            ));
+        }
+    }
+    // Explicitly ignore `Utc` — imported only so the naive branch can attach it.
+    let _ = Utc;
+    None
+}
+
+/// Interpret a bare number as epoch seconds, milliseconds, or microseconds.
+///
+/// The unit is inferred by magnitude, since logs rarely say which they mean.
+/// Thresholds are generous: anything below ~1e11 is seconds (1973–5138 CE),
+/// below ~1e14 is milliseconds, above that microseconds.
+fn epoch_to_datetime(value: f64) -> Option<DateTime> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let millis = if value < 1e11 {
+        value * 1_000.0
+    } else if value < 1e14 {
+        value
+    } else {
+        value / 1_000.0
+    };
+    if millis > i64::MAX as f64 {
+        return None;
+    }
+    Some(DateTime::from_millis(millis as i64))
 }
 
 fn extract_mcp_server_id(line: &str, fields: &HashMap<String, Value>) -> Option<String> {
@@ -1182,6 +1304,208 @@ mod tests {
             notification_entities,
             3,
             "all 3 notification lines should produce McpEvent entities"
+        );
+    }
+
+    // ── Timestamp extraction ─────────────────────────────────────────────────
+    //
+    // `otel_builder::timestamps` reads `EntityRecord.timestamp_utc` and emits
+    // `start_time_unix_nano = 0` when it is `None`. Before this was wired the
+    // field was hardcoded `None`, so every span in every sample had a zero
+    // timestamp and the SpansView waterfall was ordered by entity index.
+
+    fn ts_from(json: &str) -> Option<i64> {
+        let fields = extract_json_fields(json);
+        extract_timestamp(&fields, "").map(|dt| dt.timestamp_millis())
+    }
+
+    #[test]
+    fn rfc3339_zulu_timestamp_is_parsed() {
+        // The openai fixture's shape.
+        assert_eq!(
+            ts_from(r#"{"timestamp":"2024-01-15T10:00:00Z"}"#),
+            Some(1_705_312_800_000),
+        );
+    }
+
+    #[test]
+    fn rfc3339_with_offset_is_normalised_to_utc() {
+        // 10:00+02:00 is 08:00Z — the offset must be applied, not ignored.
+        let with_offset = ts_from(r#"{"time":"2026-04-26T10:00:00+02:00"}"#);
+        let as_utc = ts_from(r#"{"time":"2026-04-26T08:00:00Z"}"#);
+        assert_eq!(with_offset, as_utc);
+    }
+
+    #[test]
+    fn time_key_is_recognised() {
+        // The langchain fixture uses `time`, not `timestamp`.
+        assert!(ts_from(r#"{"time":"2026-04-26T10:00:01Z"}"#).is_some());
+    }
+
+    #[test]
+    fn all_timestamp_key_spellings_resolve() {
+        for key in ["timestamp", "time", "ts", "@timestamp", "date", "datetime"] {
+            let json = format!(r#"{{"{key}":"2026-04-26T10:00:00Z"}}"#);
+            assert!(ts_from(&json).is_some(), "{key} must be recognised");
+        }
+    }
+
+    #[test]
+    fn fractional_seconds_are_accepted() {
+        assert!(ts_from(r#"{"timestamp":"2026-04-26T10:00:00.123Z"}"#).is_some());
+    }
+
+    #[test]
+    fn zoneless_and_space_separated_forms_are_accepted() {
+        // Common in application logs; assumed UTC.
+        assert!(ts_from(r#"{"timestamp":"2026-04-26T10:00:02"}"#).is_some());
+        assert!(ts_from(r#"{"timestamp":"2026-04-26 10:00:02"}"#).is_some());
+    }
+
+    #[test]
+    fn logfmt_string_timestamps_parse() {
+        // Logfmt types every value as a string, including the timestamp.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "time".to_string(),
+            Value::String("2026-04-26T10:00:00Z".to_string()),
+        );
+        assert!(extract_timestamp(&fields, "").is_some());
+    }
+
+    #[test]
+    fn epoch_seconds_are_inferred() {
+        assert_eq!(
+            ts_from(r#"{"timestamp":1705312800}"#),
+            Some(1_705_312_800_000),
+        );
+    }
+
+    #[test]
+    fn epoch_millis_are_inferred() {
+        assert_eq!(
+            ts_from(r#"{"timestamp":1705312800000}"#),
+            Some(1_705_312_800_000),
+        );
+    }
+
+    #[test]
+    fn epoch_micros_are_inferred() {
+        assert_eq!(
+            ts_from(r#"{"timestamp":1705312800000000}"#),
+            Some(1_705_312_800_000),
+        );
+    }
+
+    #[test]
+    fn numeric_string_epoch_is_parsed() {
+        // Logfmt again: `ts=1705312800` arrives as a string.
+        assert_eq!(
+            ts_from(r#"{"ts":"1705312800"}"#),
+            Some(1_705_312_800_000),
+        );
+    }
+
+    #[test]
+    fn iso_date_is_not_mistaken_for_an_epoch_number() {
+        // "2024-01-15T..." must not be truncated to the number 2024. Guard
+        // against the textual and numeric branches being tried in the wrong
+        // order.
+        let parsed = ts_from(r#"{"timestamp":"2024-01-15T10:00:00Z"}"#).unwrap();
+        assert!(
+            parsed > 1_600_000_000_000,
+            "parsed as {parsed}, which looks like a bare year rather than a date",
+        );
+    }
+
+    #[test]
+    fn missing_or_unparseable_timestamps_yield_none() {
+        // Raw JSON-RPC (mcp_session.log) carries no timestamp at all — None is
+        // the correct answer, not an error.
+        assert_eq!(ts_from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#), None);
+        assert_eq!(ts_from(r#"{"timestamp":"not a date"}"#), None);
+        assert_eq!(ts_from(r#"{"timestamp":""}"#), None);
+        assert_eq!(ts_from(r#"{"timestamp":null}"#), None);
+        assert_eq!(ts_from(r#"{"timestamp":0}"#), None);
+        assert_eq!(ts_from(r#"{"timestamp":-5}"#), None);
+    }
+
+    // ── Leading timestamps in unstructured lines ─────────────────────────────
+
+    #[test]
+    fn bare_leading_timestamp_is_read_from_raw_text() {
+        // bedrock_multiline.log's shape: no key/value pairs at all.
+        let fields = HashMap::new();
+        assert!(
+            extract_timestamp(&fields, "2026-04-26 10:00:01 INFO  Invoking Bedrock model").is_some(),
+        );
+    }
+
+    #[test]
+    fn bracketed_leading_timestamp_is_read_from_raw_text() {
+        // react_agent.log's shape.
+        let fields = HashMap::new();
+        assert!(
+            extract_timestamp(&fields, "[2024-01-15 10:00:00] INFO  Starting ReAct agent").is_some(),
+        );
+    }
+
+    #[test]
+    fn iso_leading_timestamp_with_zone_is_read_from_raw_text() {
+        let fields = HashMap::new();
+        assert!(extract_timestamp(&fields, "2026-04-26T10:00:01Z something happened").is_some());
+    }
+
+    #[test]
+    fn structured_field_wins_over_the_raw_line() {
+        // When both are present the parsed field is authoritative.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "timestamp".to_string(),
+            Value::String("2020-01-01T00:00:00Z".to_string()),
+        );
+        let dt = extract_timestamp(&fields, "2026-04-26 10:00:01 INFO x").unwrap();
+        assert_eq!(
+            dt.timestamp_millis(),
+            1_577_836_800_000,
+            "should use the 2020 field value, not the 2026 line prefix",
+        );
+    }
+
+    #[test]
+    fn a_timestamp_mid_line_is_not_treated_as_leading() {
+        // Only a prefix counts; a date inside a message must not be mistaken for
+        // the event time.
+        let fields = HashMap::new();
+        assert_eq!(
+            extract_timestamp(&fields, "INFO deploy scheduled for 2026-04-26 10:00:01"),
+            None,
+        );
+    }
+
+    #[test]
+    fn plain_line_without_a_timestamp_yields_none() {
+        let fields = HashMap::new();
+        assert_eq!(extract_timestamp(&fields, "Thought: I need to search"), None);
+    }
+
+    #[test]
+    fn extracted_entities_carry_their_timestamp() {
+        // End to end through the extractor, not just the helper.
+        let line = r#"{"timestamp":"2024-01-15T10:00:05Z","model":"gpt-4o","finish_reason":"stop"}"#;
+        let entities = extract(
+            line,
+            &json_format(),
+            &None,
+            &empty_agentic(),
+            "hash",
+            "target",
+            "trace1",
+        );
+        assert!(!entities.is_empty(), "line must produce an entity");
+        assert!(
+            entities[0].timestamp_utc.is_some(),
+            "entity must carry the line's timestamp",
         );
     }
 }
