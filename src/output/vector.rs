@@ -25,6 +25,8 @@ use crate::error::AppError;
 
 pub const CONTENT_EMBEDDINGS_COLL: &str = "content_embeddings";
 pub const BEHAVIORAL_EMBEDDINGS_COLL: &str = "behavioral_embeddings";
+/// Task-intent vectors (Stage 13), keyed on `task_id` rather than `sample_hash`.
+pub const TASK_EMBEDDINGS_COLL: &str = "task_embeddings";
 
 // ─── VectorWriter ─────────────────────────────────────────────────────────────
 
@@ -65,12 +67,14 @@ impl VectorWriter {
             return Ok(0);
         }
 
-        // Ensure indexes for both collections up-front (no-op after first call).
+        // Ensure indexes for all three collections up-front (no-op after first call).
         self.ensure_indexes(CONTENT_EMBEDDINGS_COLL).await?;
         self.ensure_indexes(BEHAVIORAL_EMBEDDINGS_COLL).await?;
+        self.ensure_indexes(TASK_EMBEDDINGS_COLL).await?;
 
         let content_col    = self.db.collection::<Document>(CONTENT_EMBEDDINGS_COLL);
         let behavioral_col = self.db.collection::<Document>(BEHAVIORAL_EMBEDDINGS_COLL);
+        let task_col       = self.db.collection::<Document>(TASK_EMBEDDINGS_COLL);
         let opts           = ReplaceOptions::builder().upsert(true).build();
         let mut count      = 0usize;
 
@@ -78,6 +82,7 @@ impl VectorWriter {
             let col = match record.kind {
                 EmbeddingKind::Content    => &content_col,
                 EmbeddingKind::Behavioral => &behavioral_col,
+                EmbeddingKind::Task       => &task_col,
             };
 
             let doc = bson::to_document(record).map_err(|e| {
@@ -129,6 +134,21 @@ impl VectorWriter {
             None,
         ).await?;
 
+        // task_id index — the key for `task_embeddings`, where `sample_hash` is
+        // only provenance. Sparse, since the sample-scoped kinds never set it.
+        col.create_index(
+            IndexModel::builder()
+                .keys(doc! { "task_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name(Some(format!("{collection}_task_id")))
+                        .sparse(Some(true))
+                        .build(),
+                )
+                .build(),
+            None,
+        ).await?;
+
         // model index — filter by embedding model (e.g. "text-embedding-3-small").
         col.create_index(
             IndexModel::builder()
@@ -163,6 +183,7 @@ mod tests {
         EmbeddingRecord {
             embedding_id: format!("emb-uuid-{}", if kind == EmbeddingKind::Content { "content" } else { "beh" }),
             sample_hash:  "sha-abc".to_string(),
+            task_id:      None,
             kind,
             vector:       vec![0.1_f32; dims],
             model:        model.to_string(),
@@ -254,6 +275,7 @@ mod tests {
         let coll = match rec.kind {
             EmbeddingKind::Content    => CONTENT_EMBEDDINGS_COLL,
             EmbeddingKind::Behavioral => BEHAVIORAL_EMBEDDINGS_COLL,
+            EmbeddingKind::Task       => TASK_EMBEDDINGS_COLL,
         };
         assert_eq!(coll, "content_embeddings");
     }
@@ -264,6 +286,7 @@ mod tests {
         let coll = match rec.kind {
             EmbeddingKind::Content    => CONTENT_EMBEDDINGS_COLL,
             EmbeddingKind::Behavioral => BEHAVIORAL_EMBEDDINGS_COLL,
+            EmbeddingKind::Task       => TASK_EMBEDDINGS_COLL,
         };
         assert_eq!(coll, "behavioral_embeddings");
     }

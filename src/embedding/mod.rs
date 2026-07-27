@@ -54,6 +54,26 @@ pub enum EmbeddingKind {
     Content,
     /// Structural feature vector derived from entity/relation statistics.
     Behavioral,
+    /// Dense semantic vector over a **task's stated intent** rather than its
+    /// transcript (Stage 13).
+    ///
+    /// The odd one out in two ways. It is keyed on `task_id`, not `sample_hash`,
+    /// because a task spans samples. And it embeds one sentence — the goal — where
+    /// `Content` embeds the whole blob, which is the point: searching intents
+    /// returns tasks with a similar *purpose*, searching transcripts returns tasks
+    /// with a similar amount of logging.
+    Task,
+}
+
+impl EmbeddingKind {
+    /// The string used in the embedding id and as the collection discriminator.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmbeddingKind::Content => "content",
+            EmbeddingKind::Behavioral => "behavioral",
+            EmbeddingKind::Task => "task",
+        }
+    }
 }
 
 /// A persisted embedding record written to MongoDB by the Phase 6 adapter.
@@ -64,7 +84,14 @@ pub struct EmbeddingRecord {
     /// ⇒ same id ⇒ idempotent upsert in `output::vector::write`.
     pub embedding_id: String,
     /// FK to the parent [`crate::models::SampleRecord`].
+    ///
+    /// For [`EmbeddingKind::Task`] this is the sample the intent text was read
+    /// from — provenance rather than the key, since a task spans samples.
     pub sample_hash: String,
+    /// FK to the task, set only for [`EmbeddingKind::Task`], where it is the
+    /// actual key. `None` for the sample-scoped kinds.
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub kind: EmbeddingKind,
     /// The dense vector.
     pub vector: Vec<f32>,
@@ -87,15 +114,38 @@ impl EmbeddingRecord {
         // Same sample + same kind + same model ⇒ same id ⇒ idempotent upsert.
         // Swapping the model invalidates the id, so re-embedding under a
         // different model inserts a fresh row instead of overwriting.
-        let kind_str = match kind {
-            EmbeddingKind::Content    => "content",
-            EmbeddingKind::Behavioral => "behavioral",
-        };
+        let kind_str = kind.as_str();
         let embedding_id = ids::derive_embedding_id(sample_hash, kind_str, model);
         Self {
             embedding_id,
             sample_hash: sample_hash.to_string(),
+            task_id: None,
             kind,
+            vector,
+            model: model.to_string(),
+            dimensions,
+            created_at: DateTime::now(),
+        }
+    }
+
+    /// Build a task-intent embedding record.
+    ///
+    /// Keyed on `task_id` rather than `sample_hash`, since a task spans samples
+    /// and there must be exactly one intent vector per task however many samples
+    /// it was assembled from. `sample_hash` is retained as provenance: which
+    /// sample the intent sentence was actually read from.
+    pub fn for_task(
+        task_id: &str,
+        sample_hash: &str,
+        vector: Vec<f32>,
+        model: &str,
+    ) -> Self {
+        let dimensions = vector.len() as u32;
+        Self {
+            embedding_id: ids::derive_embedding_id(task_id, EmbeddingKind::Task.as_str(), model),
+            sample_hash: sample_hash.to_string(),
+            task_id: Some(task_id.to_string()),
+            kind: EmbeddingKind::Task,
             vector,
             model: model.to_string(),
             dimensions,
@@ -225,6 +275,54 @@ impl EmbeddingWorker {
             sample_hash: sample_hash.to_string(),
             content_vector,
             behavioral_vector,
+        }
+    }
+
+    /// Embed a task's stated intent (Stage 13).
+    ///
+    /// Returns `None` — without erroring — when embedding is disabled, no API key
+    /// is configured, or the call fails. A task simply has no intent vector in
+    /// those cases and is absent from intent search, which is strictly better than
+    /// indexing a placeholder that would match queries misleadingly.
+    ///
+    /// Unlike behavioral embeddings there is no local fallback: the whole point is
+    /// semantic similarity of natural-language goals, and that needs a real model.
+    pub async fn embed_task_intent(
+        &self,
+        task_id: &str,
+        sample_hash: &str,
+        intent_text: &str,
+    ) -> Option<EmbeddingRecord> {
+        if !self.config.enabled || self.config.api_key.is_empty() {
+            return None;
+        }
+
+        let text = content::truncate(intent_text, self.config.max_text_chars);
+        match content::embed(
+            &self.http,
+            &self.config.api_base_url,
+            &self.config.api_key,
+            &self.config.model,
+            self.config.dimensions,
+            &text,
+        )
+        .await
+        {
+            Ok(Some(vector)) => Some(EmbeddingRecord::for_task(
+                task_id,
+                sample_hash,
+                vector,
+                &self.config.model,
+            )),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    task_id,
+                    error = %e,
+                    "task intent embedding failed — task will be absent from intent search"
+                );
+                None
+            }
         }
     }
 }

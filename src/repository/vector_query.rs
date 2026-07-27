@@ -88,6 +88,10 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ScoredHit {
     pub sample_hash: String,
+    /// Set only for [`crate::embedding::EmbeddingKind::Task`] hits, where it — not
+    /// `sample_hash` — is the thing the caller asked about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub embedding_id: String,
     /// Cosine similarity in `-1.0..=1.0`; `1.0` is identical.
     pub score: f32,
@@ -98,6 +102,8 @@ pub struct ScoredHit {
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub sample_hash: String,
+    /// Present for task-intent embeddings only.
+    pub task_id: Option<String>,
     pub embedding_id: String,
     pub model: String,
     pub vector: Vec<f32>,
@@ -131,6 +137,7 @@ pub fn rank(query: &[f32], candidates: &[Candidate], limit: usize) -> Ranking {
         match cosine_similarity(query, &candidate.vector) {
             Some(score) => hits.push(ScoredHit {
                 sample_hash: candidate.sample_hash.clone(),
+                task_id: candidate.task_id.clone(),
                 embedding_id: candidate.embedding_id.clone(),
                 score,
                 model: candidate.model.clone(),
@@ -160,6 +167,7 @@ mod tests {
     fn candidate(hash: &str, vector: Vec<f32>) -> Candidate {
         Candidate {
             sample_hash: hash.to_string(),
+            task_id: None,
             embedding_id: format!("eid-{hash}"),
             model: "behavioral-v1".to_string(),
             vector,

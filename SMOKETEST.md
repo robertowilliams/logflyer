@@ -231,6 +231,57 @@ mongosh log_samples --eval '
   printjson(db.sample_metadata.aggregate([{$unwind:"$entities"},{$count:"n"}]).toArray())'
 ```
 
+### Task intent and intent search (Stage 13)
+
+A task's **intent** is the sentence stating what it was for, embedded on its own
+so that searching returns tasks with a similar *purpose* rather than a similar
+amount of logging.
+
+```bash
+mongosh log_samples --eval '
+  db.tasks.find({}, {_id:0, task_id_source:1, intent_text:1}).forEach(printjson)'
+```
+
+Expected on the bundled fixtures — note that **two of five decline**, which is
+the intended behaviour rather than a gap:
+
+| Fixture | Intent |
+|---|---|
+| `openai_chat_completions.log` | "You are a helpful AI assistant specialized in research and web search." |
+| `langchain_json.log` | "I need to search for the current weather" |
+| `react_agent.log` | "I need to find the current weather in New York City and then convert…" |
+| `crewai_logfmt.log` | *none* |
+| `mcp_session.log` | *none* |
+
+crewai declines because its only reasoning-role lines are `crew.kickoff called`
+and `crew.kickoff finished` — lifecycle events, not goals. Indexing one would
+make every crewai run look identical and quietly ruin the search, so an intent is
+only accepted from a reasoning entity carrying an explicit marker (`Thought:`,
+`Plan:`, `Goal:`, …), which is then stripped. **No intent is better than a
+misleading one.**
+
+Intent search itself needs an embedding provider:
+
+```bash
+export EMBEDDING_ENABLED=true EMBEDDING_API_KEY=sk-...
+cargo run -- smoketest tests/fixtures/openai_chat_completions.log
+
+# Then "find tasks like this one":
+curl -s -X POST http://localhost:8080/api/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"task_id":"<id>","kind":"task","limit":5}' | jq '.hits[] | {score, task_id}'
+```
+
+Task search keys on `task_id`, **not** `sample_hash` — a task spans samples, so
+there is one intent vector per task. Passing `sample_hash` with `kind: "task"` is
+a 400 rather than a silent empty result.
+
+⚠️ **Not yet verified end to end:** the embedding provider call itself. Everything
+either side of it — intent selection, record construction, storage, keying,
+ranking, self-exclusion — is covered by integration tests using an injected
+vector. What remains untested is that the model returns a usable vector, which
+needs a real API key.
+
 ### Vector search
 
 Embeddings are keyed per **sample**, so this finds similar *samples* — the

@@ -42,9 +42,16 @@ use crate::repository::{DEFAULT_LIMIT, MAX_LIMIT};
 #[derive(Deserialize)]
 pub struct SearchRequest {
     /// Search by example: use this sample's own embedding as the query.
-    /// Mutually exclusive with `vector`.
+    /// Mutually exclusive with `vector` and `task_id`.
     #[serde(default)]
     pub sample_hash: Option<String>,
+    /// Search by example for `kind: "task"` — find tasks resembling this one.
+    ///
+    /// Separate from `sample_hash` because task embeddings are keyed on
+    /// `task_id`; conflating them would silently look up the wrong field and
+    /// report "no embedding" for a task that has one.
+    #[serde(default)]
+    pub task_id: Option<String>,
     /// Search by an explicit query vector.
     #[serde(default)]
     pub vector: Option<Vec<f32>>,
@@ -82,23 +89,47 @@ pub async fn search(
     let kind = match req.kind.as_deref() {
         None | Some("behavioral") => EmbeddingKind::Behavioral,
         Some("content") => EmbeddingKind::Content,
+        Some("task") => EmbeddingKind::Task,
         Some(other) => {
             return Err(bad_request(format!(
-                "unknown kind {other:?}; expected \"content\" or \"behavioral\""
+                "unknown kind {other:?}; expected \"content\", \"behavioral\" or \"task\""
             )))
         }
     };
 
+    // `task_id` is the search-by-example key for task search, `sample_hash` for
+    // the sample-scoped kinds. Normalise them into one "by example" id after
+    // checking the caller did not mix incompatible forms.
+    if req.task_id.is_some() && req.sample_hash.is_some() {
+        return Err(bad_request(
+            "give either `task_id` or `sample_hash`, not both".to_string(),
+        ));
+    }
+    if req.task_id.is_some() && kind != EmbeddingKind::Task {
+        return Err(bad_request(format!(
+            "`task_id` only applies to kind \"task\"; got {:?}",
+            kind_str(kind),
+        )));
+    }
+    if req.sample_hash.is_some() && kind == EmbeddingKind::Task {
+        return Err(bad_request(
+            "kind \"task\" searches by `task_id`, not `sample_hash` — task \
+             embeddings are keyed per task, not per sample"
+                .to_string(),
+        ));
+    }
+    let by_example = req.task_id.as_deref().or(req.sample_hash.as_deref());
+
     // Resolve the query vector, from whichever form the caller used.
-    let (query, self_hash) = match (req.sample_hash.as_deref(), req.vector.as_ref()) {
+    let (query, self_hash) = match (by_example, req.vector.as_ref()) {
         (Some(_), Some(_)) => {
             return Err(bad_request(
-                "give either `sample_hash` or `vector`, not both".to_string(),
+                "give either an id to search by example or a `vector`, not both".to_string(),
             ))
         }
         (None, None) => {
             return Err(bad_request(
-                "one of `sample_hash` or `vector` is required".to_string(),
+                "one of `task_id`, `sample_hash` or `vector` is required".to_string(),
             ))
         }
         (Some(hash), None) => {
@@ -158,10 +189,7 @@ pub async fn search(
 }
 
 fn kind_str(kind: EmbeddingKind) -> &'static str {
-    match kind {
-        EmbeddingKind::Content => "content",
-        EmbeddingKind::Behavioral => "behavioral",
-    }
+    kind.as_str()
 }
 
 fn bad_request(message: String) -> (StatusCode, Json<Value>) {

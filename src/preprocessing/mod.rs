@@ -41,6 +41,7 @@ pub mod schema_extractor;
 pub mod semantic_classifier;
 pub mod stats;
 pub mod task_correlator;
+pub mod task_intent;
 
 use mongodb::bson::DateTime;
 
@@ -68,6 +69,11 @@ pub struct PipelineOutput {
     /// disabled. The edges are *also* folded into `metadata.relations`; the
     /// records are carried here for the caller to persist separately.
     pub actors: Vec<crate::models::ActorRecord>,
+    /// The task's goal statement (Stage 13), when one could be identified.
+    /// `None` when task correlation is off, or the sample states no goal — in
+    /// which case the task simply has no intent embedding rather than a
+    /// misleading one built from an arbitrary line.
+    pub task_intent: Option<String>,
 }
 
 /// Current pipeline version — increment this when the output schema or logic
@@ -212,6 +218,15 @@ impl Preprocessor {
             None
         };
 
+        // ── Stage 13: task intent ─────────────────────────────────────────────
+        // The sentence stating what this task was for, to be embedded on its own.
+        // Only meaningful once a task exists, so it rides with correlation.
+        let task_intent = if task_correlation.is_some() {
+            task_intent::extract(&entities)
+        } else {
+            None
+        };
+
         let entity_count = entities.len() as u32;
         let relation_count = relations.len() as u32;
 
@@ -247,6 +262,7 @@ impl Preprocessor {
             otel_spans,
             task_correlation,
             actors: actor_extraction.map(|x| x.actors).unwrap_or_default(),
+            task_intent,
         }
     }
 }

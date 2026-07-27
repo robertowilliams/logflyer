@@ -1032,6 +1032,179 @@ async fn test_fetch_actors_page_filters() {
     assert!(none.is_empty());
 }
 
+// ─── Task intent and task search (Stage 13) ───────────────────────────────────
+//
+// The embedding itself needs an OpenAI key, which CI does not have. These tests
+// inject a synthetic vector through the same `EmbeddingRecord::for_task` /
+// `VectorWriter` / `search_embeddings` path the worker uses, so everything except
+// the HTTP call to the model is exercised. What remains unverified is narrow and
+// stated in SMOKETEST.md: that the provider returns a usable vector.
+
+/// Write a task-intent embedding with a caller-supplied vector.
+async fn seed_task_embedding(
+    repo: &MongoRepository,
+    task_id: &str,
+    sample_hash: &str,
+    vector: Vec<f32>,
+) {
+    let record = logflayer::embedding::EmbeddingRecord::for_task(
+        task_id,
+        sample_hash,
+        vector,
+        "text-embedding-3-small",
+    );
+    VectorWriter::new(repo.destination_db())
+        .write(&[record])
+        .await
+        .expect("write task embedding");
+}
+
+/// A task-intent embedding is keyed on `task_id`, not `sample_hash` — so looking
+/// it up must use the right field, and searching must return the task.
+#[tokio::test]
+async fn test_task_embeddings_are_keyed_on_task_id() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    seed_task_embedding(&repo, "task-alpha", "sample-1", vec![1.0, 0.0, 0.0]).await;
+
+    // Looked up by task_id — the whole point of the separate key field.
+    let v = repo
+        .fetch_embedding_vector("task-alpha", EmbeddingKind::Task)
+        .await
+        .expect("fetch")
+        .expect("task must have an intent vector");
+    assert_eq!(v, vec![1.0, 0.0, 0.0]);
+
+    // The sample hash must NOT resolve it: that would mean the key field is wrong.
+    assert!(
+        repo.fetch_embedding_vector("sample-1", EmbeddingKind::Task)
+            .await
+            .unwrap()
+            .is_none(),
+        "task embeddings are keyed on task_id, not sample_hash",
+    );
+}
+
+/// Intent search must rank the closest task first and carry `task_id` on the hit.
+#[tokio::test]
+async fn test_task_intent_search_ranks_and_returns_task_ids() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    // Three tasks: one identical to the query, one close, one orthogonal.
+    seed_task_embedding(&repo, "task-identical", "s1", vec![1.0, 0.0]).await;
+    seed_task_embedding(&repo, "task-close", "s2", vec![0.92, 0.08]).await;
+    seed_task_embedding(&repo, "task-unrelated", "s3", vec![0.0, 1.0]).await;
+
+    let result = repo
+        .search_embeddings(EmbeddingKind::Task, &[1.0, 0.0], 10, None, None)
+        .await
+        .expect("search");
+
+    assert_eq!(result.scored, 3);
+    assert_eq!(result.skipped, 0);
+    assert_eq!(
+        result.hits.iter().filter_map(|h| h.task_id.as_deref()).collect::<Vec<_>>(),
+        vec!["task-identical", "task-close", "task-unrelated"],
+        "hits must be ordered by similarity and carry task_id",
+    );
+    assert!((result.hits[0].score - 1.0).abs() < 1e-5);
+}
+
+/// "Find tasks like this one" — search by example, excluding the query task.
+#[tokio::test]
+async fn test_task_search_by_example_excludes_itself() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    seed_task_embedding(&repo, "task-query", "s1", vec![1.0, 0.0]).await;
+    seed_task_embedding(&repo, "task-other", "s2", vec![0.9, 0.1]).await;
+
+    let query = repo
+        .fetch_embedding_vector("task-query", EmbeddingKind::Task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Excluding self must drop it by task_id, not by sample_hash.
+    let result = repo
+        .search_embeddings(EmbeddingKind::Task, &query, 10, None, Some("task-query"))
+        .await
+        .expect("search");
+
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].task_id.as_deref(), Some("task-other"));
+}
+
+/// A task's intent is set once — a later sample must not overwrite the goal.
+#[tokio::test]
+async fn test_task_intent_is_first_writer_wins() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let correlation = fold_into_task(&repo, "hash-int-a", "tgt-int", "langchain_json.log").await;
+
+    let first = repo
+        .set_task_intent_if_absent(&correlation.task_id, "Summarise the AI safety news")
+        .await
+        .expect("set intent");
+    assert!(first, "the first write must set it");
+
+    let second = repo
+        .set_task_intent_if_absent(&correlation.task_id, "Something the agent said much later")
+        .await
+        .expect("second attempt");
+    assert!(!second, "a later sample must not overwrite the goal");
+
+    let task = repo.fetch_task(&correlation.task_id).await.unwrap().unwrap();
+    assert_eq!(
+        task["intent_text"].as_str(),
+        Some("Summarise the AI safety news"),
+        "the original goal must survive",
+    );
+}
+
+/// Real fixtures must yield an intent, and it must be the goal rather than noise.
+#[tokio::test]
+async fn test_intent_extracted_from_a_real_fixture() {
+    let content = fixture("openai_chat_completions.log");
+    let out = Preprocessor::new(default_preprocessing_config()).run("h-intent", "t", &content);
+
+    let intent = out
+        .task_intent
+        .expect("the openai fixture opens with a system prompt");
+    assert!(
+        intent.len() >= logflayer::preprocessing::task_intent::MIN_INTENT_CHARS,
+        "intent must clear the minimum length: {intent:?}",
+    );
+    // The goal sentence, not the surrounding JSON.
+    assert!(
+        !intent.contains("{\"") && !intent.contains("timestamp"),
+        "intent must be the content field, not the raw line: {intent:?}",
+    );
+}
+
 // ─── Similarity search ────────────────────────────────────────────────────────
 
 /// `search_embeddings` must rank a sample's own vector first at 1.0, honour the

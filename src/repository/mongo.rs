@@ -23,7 +23,9 @@ use crate::config_history;
 use crate::embedding::EmbeddingKind;
 use crate::error::AppError;
 use crate::preprocessing::task_correlator::SAMPLE_FALLBACK;
-use crate::output::vector::{BEHAVIORAL_EMBEDDINGS_COLL, CONTENT_EMBEDDINGS_COLL};
+use crate::output::vector::{
+    BEHAVIORAL_EMBEDDINGS_COLL, CONTENT_EMBEDDINGS_COLL, TASK_EMBEDDINGS_COLL,
+};
 use crate::models::{
     ActorRecord, ClassificationRecord, ClassificationStatus, SampleMetadata, SampleRecord,
 };
@@ -1846,6 +1848,39 @@ impl MongoRepository {
         Ok(())
     }
 
+    /// Record a task's intent, but only if it does not already have one.
+    ///
+    /// Returns `true` when this call actually set it — the caller uses that to
+    /// decide whether an embedding needs generating, so re-processing does not
+    /// re-bill the embedding API.
+    ///
+    /// **First writer wins**, deliberately. A task's goal is stated once, usually
+    /// in its first sample; a later sample of the same task carries continuation
+    /// text, and letting that overwrite would replace the goal with whatever the
+    /// agent happened to be saying by then. The filter on `intent_text: null` makes
+    /// this atomic rather than a read-then-write race between concurrent samples.
+    pub async fn set_task_intent_if_absent(
+        &self,
+        task_id: &str,
+        intent_text: &str,
+    ) -> Result<bool, AppError> {
+        let col = self.destination_database.collection::<Document>(TASKS_COLL);
+        let result = col
+            .update_one(
+                doc! {
+                    "task_id": task_id,
+                    "$or": [
+                        { "intent_text": { "$exists": false } },
+                        { "intent_text": null },
+                    ],
+                },
+                doc! { "$set": { "intent_text": intent_text } },
+                None,
+            )
+            .await?;
+        Ok(result.modified_count > 0)
+    }
+
     /// Whether a sample has already been counted into its task.
     ///
     /// Callers check this before [`Self::upsert_task`] so the `$inc` counters are
@@ -1980,8 +2015,11 @@ impl MongoRepository {
             .projection(doc! { "vector": 1 })
             .build();
 
+        // Task embeddings are keyed on `task_id`; the sample-scoped kinds on
+        // `sample_hash`. Looking up the wrong field would silently find nothing
+        // and read as "this task has no embedding".
         let Some(doc) = col
-            .find_one(doc! { "sample_hash": sample_hash }, opts)
+            .find_one(doc! { key_field(kind): sample_hash }, opts)
             .await?
         else {
             return Ok(None);
@@ -2022,7 +2060,8 @@ impl MongoRepository {
 
         let mut filter = Document::new();
         if let Some(hash) = exclude_sample_hash {
-            filter.insert("sample_hash", doc! { "$ne": hash });
+            // Excluding "self" means a different field per kind — see `key_field`.
+            filter.insert(key_field(kind), doc! { "$ne": hash });
         }
         // Embedding records carry no target_id, so narrowing by target means
         // resolving that target's sample hashes first.
@@ -2040,7 +2079,9 @@ impl MongoRepository {
         }
 
         let opts = FindOptions::builder()
-            .projection(doc! { "sample_hash": 1, "embedding_id": 1, "model": 1, "vector": 1 })
+            .projection(
+                doc! { "sample_hash": 1, "task_id": 1, "embedding_id": 1, "model": 1, "vector": 1 },
+            )
             .limit(MAX_SCAN as i64)
             .build();
 
@@ -2053,6 +2094,7 @@ impl MongoRepository {
             };
             candidates.push(Candidate {
                 sample_hash: doc.get_str("sample_hash").unwrap_or_default().to_string(),
+                task_id: doc.get_str("task_id").ok().map(str::to_string),
                 embedding_id: doc.get_str("embedding_id").unwrap_or_default().to_string(),
                 model: doc.get_str("model").unwrap_or_default().to_string(),
                 vector: vector_arr
@@ -2208,6 +2250,19 @@ fn embedding_collection(kind: EmbeddingKind) -> &'static str {
     match kind {
         EmbeddingKind::Content => CONTENT_EMBEDDINGS_COLL,
         EmbeddingKind::Behavioral => BEHAVIORAL_EMBEDDINGS_COLL,
+        EmbeddingKind::Task => TASK_EMBEDDINGS_COLL,
+    }
+}
+
+/// Which field identifies an embedding record of a given kind.
+///
+/// Content and behavioral vectors are per sample; a task's intent vector is per
+/// task, because a task spans samples. Getting this wrong does not error — it
+/// finds nothing, and reads as "no embedding exists".
+fn key_field(kind: EmbeddingKind) -> &'static str {
+    match kind {
+        EmbeddingKind::Task => "task_id",
+        _ => "sample_hash",
     }
 }
 

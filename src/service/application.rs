@@ -478,6 +478,7 @@ async fn run_preprocessing(
     let otel_spans = pipeline_output.otel_spans;
     let task_correlation = pipeline_output.task_correlation;
     let actors = pipeline_output.actors;
+    let task_intent = pipeline_output.task_intent;
 
     let worth = metadata.ingestion_hints.worth_classifying;
     let score = metadata.agentic_scan.signal_score;
@@ -506,6 +507,18 @@ async fn run_preprocessing(
             // sample list would have holes in it.
             if let Some(ref correlation) = task_correlation {
                 upsert_task_for_sample(repository, &metadata, correlation).await;
+
+                // Stage 13: record the goal and embed it, once per task.
+                if let Some(ref intent) = task_intent {
+                    embed_task_intent_once(
+                        repository,
+                        async_outputs,
+                        &correlation.task_id,
+                        &metadata.sample_hash,
+                        intent,
+                    )
+                    .await;
+                }
             }
 
             // Stage 12: persist the actor nodes. Their edges already travelled
@@ -698,6 +711,55 @@ async fn upsert_task_for_sample(
         new_to_task = !already_counted,
         "folded sample into task"
     );
+}
+
+/// Record a task's intent and embed it — exactly once per task (Stage 13).
+///
+/// The embedding is generated **only when this call is the one that set the
+/// intent**. Every subsequent sample of the same task takes the early return, so
+/// a long task does not re-bill the embedding API once per sample.
+///
+/// Silently does nothing when no embedding worker is configured. The task keeps
+/// its `intent_text` either way, so enabling embeddings later and re-running
+/// fills in the vectors without losing the goals recorded in the meantime.
+async fn embed_task_intent_once(
+    repository: &MongoRepository,
+    outputs: &AsyncOutputs,
+    task_id: &str,
+    sample_hash: &str,
+    intent: &str,
+) {
+    let newly_set = match repository.set_task_intent_if_absent(task_id, intent).await {
+        Ok(set) => set,
+        Err(error) => {
+            warn!(error = ?error, task_id, "could not record task intent");
+            return;
+        }
+    };
+    if !newly_set {
+        return; // Another sample of this task already stated the goal.
+    }
+
+    let (Some(worker), Some(writer)) = (
+        outputs.embedding_worker.as_ref(),
+        outputs.vector_writer.as_ref(),
+    ) else {
+        // Intent recorded, embedding deferred until a worker exists.
+        return;
+    };
+
+    let Some(record) = worker
+        .embed_task_intent(task_id, sample_hash, intent)
+        .await
+    else {
+        // Disabled, no API key, or the call failed — already logged by the worker.
+        return;
+    };
+
+    match writer.write(std::slice::from_ref(&record)).await {
+        Ok(_) => info!(task_id, dimensions = record.dimensions, "embedded task intent"),
+        Err(error) => warn!(error = ?error, task_id, "failed to write task intent embedding"),
+    }
 }
 
 /// Persist a sample's actor nodes (Stage 12).
