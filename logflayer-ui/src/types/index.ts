@@ -225,9 +225,8 @@ export function isActor(node: GraphNode): node is ActorRecord {
   return 'actor_id' in node
 }
 
-/** Backend `models::RelationSource` — `#[serde(rename_all = "snake_case")]`. */
 /** Backend `models::RelationSource` — `#[serde(rename_all = "snake_case")]`.
- *  `inferred` is the `#[default]` and the source of most rules; it was missing. */
+ *  `inferred` is the `#[default]` and the source of most rules. */
 export type RelationSource = 'explicit' | 'inferred' | 'parsed'
 
 /** Backend `prov_linker::ProvPredicate` — `#[serde(rename_all = "camelCase")]`. */
@@ -273,6 +272,10 @@ export interface EntityRecord {
   timestamp_utc?:            string | null
   content_embedding_id?:     string | null
   behavioral_embedding_id?:  string | null
+  /** Stage 11. The task this event belongs to; empty when correlation is off. */
+  task_id?:                  string
+  /** The raw correlation value the task id came from, when there was one. */
+  correlation_key?:          string | null
 }
 
 /** Mirror of `models::RelationEdge`. */
@@ -307,7 +310,11 @@ export interface GraphTraversal {
    *  frontier emptied first. */
   depth_reached: number
   edges:         RelationEdge[]
-  entities:      EntityRecord[]
+  /** Events *and* actors. Actor edges run event → actor, so a traversal
+   *  routinely returns both — branch with `isActor`. Typing this as
+   *  `EntityRecord[]` compiled and ran, but any consumer trusting it and
+   *  reading `.entity_type` off an actor got `undefined` with no error. */
+  entities:      GraphNode[]
   node_ids:      string[]
   node_count:    number
   edge_count:    number
@@ -342,7 +349,8 @@ export interface GraphPath {
   hops:      PathHop[]
   hop_count: number
   edges:     RelationEdge[]
-  entities:  EntityRecord[]
+  /** Events *and* actors — an actor is a legitimate path endpoint. */
+  entities:  GraphNode[]
   node_ids:  string[]
 }
 
@@ -433,6 +441,79 @@ export interface SampleMetadata {
   relations:             RelationEdge[]
   entity_count:          number
   relation_count:        number
+  /** Stage 11. The task this sample belongs to. */
+  task_id?:              string
+  /** Which field the task id came from — a `CORRELATION_KEYS` entry, or
+   *  `"sample"` when the log carried none. `"sample"` means "we could not
+   *  tell", so it should not be presented with the same confidence. */
+  task_id_source?:       string
+}
+
+/**
+ * Mirror of `models::TaskRecord` — a unit of work spanning one or more samples.
+ *
+ * Returned by `GET /api/v1/tasks` and `GET /api/v1/tasks/:task_id`.
+ */
+export interface TaskRecord {
+  task_id:        string
+  /** See `SampleMetadata.task_id_source`. */
+  task_id_source: string
+  correlation_key?: string | null
+  /** The sentence stating what the task was for, when one could be extracted.
+   *  Written once and never overwritten, so it reflects the first sample seen. */
+  intent_text?:   string | null
+  sample_hashes:  string[]
+  trace_ids:      string[]
+  target_ids:     string[]
+  entity_count:   number
+  relation_count: number
+  first_seen:     string
+  last_seen:      string
+}
+
+/** Backend `embedding::EmbeddingKind` — `#[serde(rename_all = "snake_case")]`. */
+export type EmbeddingKind = 'content' | 'behavioral' | 'task'
+
+/** One ranked result from `POST /api/v1/search`, mirroring `vector_query::ScoredHit`. */
+export interface ScoredHit {
+  sample_hash:  string
+  /** Present only for `kind: 'task'` results, which are keyed on the task. */
+  task_id?:     string | null
+  embedding_id: string
+  model:        string
+  /** Cosine similarity, clamped to [-1, 1]. */
+  score:        number
+}
+
+/** Response of `POST /api/v1/search`. */
+export interface SearchResponse {
+  hits:    ScoredHit[]
+  /** Candidates actually compared. */
+  scored:  number
+  /** Candidates skipped for a dimension mismatch — a non-zero value usually
+   *  means vectors from two different models are in one collection. */
+  skipped: number
+  /** True when the scan hit its budget, so the ranking may be incomplete. */
+  truncated: boolean
+}
+
+/**
+ * Response of `GET /api/v1/tasks/:task_id/graph` — the audit payload.
+ *
+ * `truncated` means the task spans more samples than one response assembles;
+ * `sample_hashes` then lists the subset actually included.
+ */
+export interface TaskGraph {
+  task:           TaskRecord
+  entities:       EntityRecord[]
+  relations:      RelationEdge[]
+  actors:         ActorRecord[]
+  sample_hashes:  string[]
+  entity_count:   number
+  relation_count: number
+  actor_count:    number
+  sample_count:   number
+  truncated:      boolean
 }
 
 export interface ClassificationRecord {

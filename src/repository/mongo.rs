@@ -1530,7 +1530,7 @@ impl MongoRepository {
                 to: to.to_string(),
                 hops: Vec::new(),
                 edges: Vec::new(),
-                entities: self.fetch_entities_by_ids(&[from.to_string()]).await?,
+                entities: self.fetch_graph_nodes_by_ids(&[from.to_string()]).await?,
                 node_ids: vec![from.to_string()],
                 truncated: false,
             }));
@@ -1576,9 +1576,16 @@ impl MongoRepository {
             .collect();
 
         // Nodes on the path only — not the whole neighbourhood we searched.
+        //
+        // Hydrated through `fetch_graph_nodes_by_ids`, like `traverse_graph`, not
+        // `fetch_entities_by_ids`. Actor edges run event → actor, so an actor is a
+        // legitimate sink and a perfectly ordinary path endpoint; resolving only
+        // against `sample_metadata.entities` left it missing from `entities` while
+        // still present in `node_ids`, and the frontend asserts the opposite by
+        // hard-coding `unresolved_node_ids: []` for paths.
         let mut node_ids = vec![from.to_string()];
         node_ids.extend(hops.iter().map(|h| h.to.clone()));
-        let entities = self.fetch_entities_by_ids(&node_ids).await?;
+        let entities = self.fetch_graph_nodes_by_ids(&node_ids).await?;
 
         Ok(PathOutcome::Found(PathResult {
             from: from.to_string(),
@@ -2170,10 +2177,16 @@ impl MongoRepository {
             .destination_database
             .collection::<Document>(embedding_collection(kind));
 
-        let mut filter = Document::new();
+        // Conditions are collected and combined with `$and` rather than inserted
+        // straight into one document. Both clauses below can target
+        // `sample_hash`, and `Document::insert` is a map insert — the second
+        // silently replaced the first, so any content or behavioral search that
+        // also passed `target_id` lost its self-exclusion and returned the query's
+        // own sample as hit #1 at score 1.0 despite `include_self: false`.
+        let mut clauses: Vec<Document> = Vec::new();
         if let Some(hash) = exclude_sample_hash {
             // Excluding "self" means a different field per kind — see `key_field`.
-            filter.insert(key_field(kind), doc! { "$ne": hash });
+            clauses.push(doc! { key_field(kind): { "$ne": hash } });
         }
         // Embedding records carry no target_id, so narrowing by target means
         // resolving that target's sample hashes first.
@@ -2187,8 +2200,14 @@ impl MongoRepository {
                     truncated: false,
                 });
             }
-            filter.insert("sample_hash", doc! { "$in": hashes });
+            clauses.push(doc! { "sample_hash": { "$in": hashes } });
         }
+
+        let filter = match clauses.len() {
+            0 => Document::new(),
+            1 => clauses.pop().expect("len checked"),
+            _ => doc! { "$and": clauses },
+        };
 
         let opts = FindOptions::builder()
             .projection(

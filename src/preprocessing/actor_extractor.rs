@@ -22,11 +22,11 @@
 //! actors-as-entities would fabricate a span for every agent and tool; and an
 //! `EntityRecord` is a parsed log line, which an actor is not.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mongodb::bson::DateTime;
 
-use super::ids;
+use super::{ids, task_correlator};
 use crate::models::{
     ActorKind, ActorRecord, EntityRecord, RelationEdge, RelationSource, RelationType,
 };
@@ -54,11 +54,25 @@ pub fn extract(entities: &[EntityRecord], sample_hash: &str, task_id: &str) -> A
     let now = DateTime::now();
 
     for entity in entities {
+        // Actor ids already seen on *this* event.
+        //
+        // `candidates` emits an Agent for `model_id` and another for
+        // `agent_id`, which is right when they name different things but wrong
+        // when they carry the same string — `agent=claude-3-opus
+        // model=claude-3-opus` is one participant described twice, not two. Left
+        // undeduplicated it counted the event twice and emitted two edges with
+        // an identical `relation_id`, which then inflated the task's
+        // `relation_count`.
+        let mut seen_on_event: HashSet<String> = HashSet::new();
+
         // An event can involve all three kinds at once — an MCP tool call made by
         // a named model touches an agent, a skill and a resource.
         for (kind, name, field, relation) in candidates(entity) {
             let Some(name) = normalise(name) else { continue };
             let actor_id = ids::derive_actor_id(kind.as_str(), &name);
+            if !seen_on_event.insert(actor_id.clone()) {
+                continue;
+            }
 
             let record = actors.entry(actor_id.clone()).or_insert_with(|| ActorRecord {
                 actor_id: actor_id.clone(),
@@ -135,15 +149,16 @@ fn candidates(
 /// A blank or placeholder name would collapse every event that shares the
 /// emptiness into one meaningless hub node — the same failure the task correlator
 /// guards against.
+/// Uses the same placeholder list as the task correlator. The two were separate
+/// and had drifted: this one was missing `<nil>`, so a Go log's
+/// `tool_name=<nil>` became a Skill node literally named `<nil>`.
 fn normalise(name: Option<&str>) -> Option<String> {
     let trimmed = name?.trim();
-    if trimmed.is_empty() || PLACEHOLDER_NAMES.contains(&trimmed.to_ascii_lowercase().as_str()) {
+    if trimmed.is_empty() || task_correlator::is_placeholder(&trimmed.to_ascii_lowercase()) {
         return None;
     }
     Some(trimmed.to_string())
 }
-
-const PLACEHOLDER_NAMES: &[&str] = &["null", "nil", "none", "unknown", "-", "n/a", "undefined"];
 
 /// Build an event → actor edge.
 ///
@@ -219,6 +234,80 @@ mod tests {
             x.actors.iter().map(|a| (a.kind, a.name.as_str())).collect();
         v.sort_by(|a, b| a.1.cmp(b.1));
         v
+    }
+
+    // ── One participant described twice is still one participant ─────────────
+
+    #[test]
+    fn a_model_and_agent_with_the_same_name_are_one_actor() {
+        // `agent=claude-3-opus model=claude-3-opus` is common — an agent named
+        // after its model. `candidates` emits an Agent for each field, and
+        // undeduplicated they both resolved to the same actor_id.
+        let mut e = entity("e1");
+        e.model_id = Some("claude-3-opus".to_string());
+        e.extracted_fields
+            .insert("agent".to_string(), serde_json::json!("claude-3-opus"));
+
+        let x = extract(&[e], "h", "task");
+
+        assert_eq!(x.actors.len(), 1, "one name, one node");
+        assert_eq!(
+            x.actors[0].event_count, 1,
+            "one event must count once, not once per field naming the same actor",
+        );
+        assert_eq!(x.edges.len(), 1, "and must not emit two edges");
+    }
+
+    #[test]
+    fn duplicate_edges_never_share_a_relation_id() {
+        // The concrete corruption: `derive_relation_id` keys on
+        // (sample_hash, type, source, target), so two edges for one
+        // (event, actor, PerformedBy) pair are byte-identical rows that both
+        // ride in `metadata.relations` and inflate the task's relation_count.
+        let mut e = entity("e1");
+        e.model_id = Some("dup".to_string());
+        e.extracted_fields
+            .insert("agent_id".to_string(), serde_json::json!("dup"));
+
+        let x = extract(&[e], "h", "task");
+        let mut ids: Vec<&str> = x.edges.iter().map(|r| r.relation_id.as_str()).collect();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "relation ids must be unique");
+    }
+
+    #[test]
+    fn a_model_and_a_differently_named_agent_stay_two_actors() {
+        // The dedup must not collapse the case it was never about: a named role
+        // and the model backing it are genuinely two participants.
+        let mut e = entity("e1");
+        e.model_id = Some("claude-3-opus".to_string());
+        e.extracted_fields
+            .insert("agent".to_string(), serde_json::json!("researcher"));
+
+        let x = extract(&[e], "h", "task");
+        assert_eq!(x.actors.len(), 2);
+        assert_eq!(x.edges.len(), 2);
+    }
+
+    #[test]
+    fn the_same_actor_on_two_events_counts_twice() {
+        // Dedup is per event, not per sample — two tool calls to one skill are
+        // one node with two edges and an event_count of 2.
+        let x = extract(&[with_tool("e1", "search"), with_tool("e2", "search")], "h", "task");
+        assert_eq!(x.actors.len(), 1);
+        assert_eq!(x.actors[0].event_count, 2);
+        assert_eq!(x.edges.len(), 2);
+    }
+
+    #[test]
+    fn go_style_nil_is_not_a_skill() {
+        // The actor placeholder list was missing `<nil>` while the correlator's
+        // had it, so a Go log produced a Skill node literally named `<nil>`.
+        let x = extract(&[with_tool("e1", "<nil>")], "h", "task");
+        assert!(x.actors.is_empty(), "got {:?}", kinds(&x));
+        assert!(x.edges.is_empty());
     }
 
     // ── Derivation ───────────────────────────────────────────────────────────

@@ -120,22 +120,53 @@ fn is_lifecycle_noise(text: &str) -> bool {
 /// Prefers a structured `content` / `prompt` / `input` field over `raw_text`,
 /// because `raw_text` is the whole JSON line — braces, timestamps, token counts
 /// — and embedding that buries the sentence that matters.
+///
+/// # The `raw_text` fallback is only valid for plain-text logs
+///
+/// `extracted_fields` holds a line's **top-level** keys and is not flattened, so
+/// the ordinary shape of an LLM log —
+/// `{"message":{"content":[{"type":"text","text":"Summarise Q3 revenue"}]}}` —
+/// matches no field: `message` exists but is an object, so `as_str()` is `None`.
+/// Falling through to `raw_text` there made the task's stated goal the entire
+/// JSON line. It cleared `MIN_INTENT_CHARS`, so nothing rejected it; it was
+/// written by `set_task_intent_if_absent`, where the first writer wins
+/// permanently; and it was then embedded and indexed. That is exactly what the
+/// paragraph above says must not happen, bypassed by the common case.
+///
+/// So the fallback now applies only when the line is *not* structured. A JSON
+/// line whose text is nested yields `None` — no intent is better than an intent
+/// made of token counts, because a wrong one is permanent and poisons search.
 fn usable_text(entity: &EntityRecord) -> Option<String> {
     const TEXT_FIELDS: &[&str] = &["content", "prompt", "input", "message", "msg", "text", "query"];
 
-    let candidate = TEXT_FIELDS
-        .iter()
-        .find_map(|k| {
-            entity
-                .extracted_fields
-                .get(*k)
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
+    let field_text = TEXT_FIELDS.iter().find_map(|k| {
+        entity
+            .extracted_fields
+            .get(*k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+
+    let candidate = match field_text {
+        Some(text) => text,
         // Plain-text logs have no fields at all; the line itself is the content.
-        .unwrap_or_else(|| entity.raw_text.clone());
+        None if !looks_structured(&entity.raw_text) => entity.raw_text.clone(),
+        None => return None,
+    };
 
     normalise(&candidate)
+}
+
+/// Whether a line is structured, and so whose `raw_text` is machine syntax
+/// rather than prose.
+///
+/// Deliberately cheap and shape-based rather than a parse: the question is only
+/// "would embedding this line embed punctuation instead of a sentence", and a
+/// line that opens with a brace or bracket answers yes whether or not it is
+/// well-formed JSON.
+fn looks_structured(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
 }
 
 /// Collapse whitespace, trim, and reject text too short or too long to be useful.
@@ -194,6 +225,57 @@ mod tests {
         e.extracted_fields.clear();
         e.raw_text = raw.to_string();
         e
+    }
+
+    // ── A structured line is never its own intent ────────────────────────────
+
+    #[test]
+    fn a_json_line_whose_text_is_nested_yields_no_intent() {
+        // `extracted_fields` holds top-level keys only and is not flattened, so
+        // this shape — the ordinary one for an LLM log — matched no text field:
+        // `message` exists but is an object, so `as_str()` is None. Falling
+        // through to `raw_text` made the task's stated goal the whole JSON line,
+        // token counts and all. It cleared MIN_INTENT_CHARS, was written by
+        // `set_task_intent_if_absent` where the first writer wins permanently,
+        // and was then embedded.
+        let raw = r#"{"ts":"2026-04-26T10:00:00Z","model":"claude-opus-4","#.to_string()
+            + r#""message":{"content":[{"type":"text","text":"Summarise Q3 revenue"}]},"#
+            + r#""usage":{"input_tokens":812,"output_tokens":44}}"#;
+
+        let e = raw_entity(SemanticRole::UserTurn, &raw);
+        assert_eq!(
+            extract(&[e]),
+            None,
+            "no intent is better than an intent made of machine syntax",
+        );
+    }
+
+    #[test]
+    fn a_plain_text_line_is_still_usable_as_its_own_intent() {
+        // The fallback is correct for react/bedrock-style logs, where the line
+        // genuinely is the prose. Only structured lines lose it.
+        let e = raw_entity(SemanticRole::UserTurn, "Find the cheapest flight to Lisbon");
+        assert_eq!(
+            extract(&[e]).as_deref(),
+            Some("Find the cheapest flight to Lisbon"),
+        );
+    }
+
+    #[test]
+    fn a_structured_line_with_a_top_level_text_field_still_works() {
+        // The guard is on the *fallback*, not on JSON as such: when the field is
+        // there at the top level, it is used as before.
+        let mut e = raw_entity(SemanticRole::UserTurn, r#"{"content":"Summarise Q3 revenue"}"#);
+        e.extracted_fields
+            .insert("content".to_string(), serde_json::json!("Summarise Q3 revenue"));
+        assert_eq!(extract(&[e]).as_deref(), Some("Summarise Q3 revenue"));
+    }
+
+    #[test]
+    fn looks_structured_is_not_fooled_by_leading_whitespace() {
+        assert!(looks_structured("   {\"a\":1}"));
+        assert!(looks_structured("[{\"a\":1}]"));
+        assert!(!looks_structured("Summarise the Q3 report {see attached}"));
     }
 
     // ── Selection order ──────────────────────────────────────────────────────

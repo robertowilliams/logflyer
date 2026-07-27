@@ -79,8 +79,27 @@ pub fn derive_span_id(sample_hash: &str, line_index: u32) -> String {
 /// When a log carries no correlation key at all, the caller passes
 /// `("sample", sample_hash)`, which reproduces today's one-task-per-sample
 /// behaviour rather than merging unrelated work.
-pub fn derive_task_id(key_name: &str, key_value: &str) -> String {
-    truncate(sha256_hex(&[key_name, "task", key_value]), 32)
+///
+/// # `scope` — why some values must not be global
+///
+/// Sharing the id across samples is only safe when the value is *globally*
+/// unique. `session_id=8f3c1e7a-…` is. `run_id=1` is not: every system that
+/// numbers its runs from one emits it, and hashing that unscoped merges
+/// unrelated work from unrelated sources into a single task, which is precisely
+/// the failure this id exists to avoid.
+///
+/// So the caller passes `Some(target_id)` for low-entropy values. Grouping still
+/// works within one target — run 1 of a target reassembles across all its
+/// samples — but run 1 over here no longer collides with run 1 over there.
+/// High-entropy values pass `None` and stay global, so a task genuinely observed
+/// across two sources still stitches together.
+///
+/// See [`super::task_correlator::is_globally_unique`] for the entropy test.
+pub fn derive_task_id(key_name: &str, key_value: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(target) => truncate(sha256_hex(&[key_name, "task", target, key_value]), 32),
+        None => truncate(sha256_hex(&[key_name, "task", key_value]), 32),
+    }
 }
 
 /// 32-hex-char actor ID derived from `(kind, name)`.
@@ -163,10 +182,10 @@ mod tests {
     #[test]
     fn derive_task_id_is_deterministic() {
         assert_eq!(
-            derive_task_id("session_id", "sess-abc"),
-            derive_task_id("session_id", "sess-abc"),
+            derive_task_id("session_id", "sess-abc", None),
+            derive_task_id("session_id", "sess-abc", None),
         );
-        assert_eq!(derive_task_id("session_id", "sess-abc").len(), 32);
+        assert_eq!(derive_task_id("session_id", "sess-abc", None).len(), 32);
     }
 
     #[test]
@@ -174,8 +193,8 @@ mod tests {
         // The defining property: the same correlation key must yield the same task
         // id no matter which sample it was seen in. This is what lets a task span
         // several samples.
-        let from_one_sample = derive_task_id("session_id", "sess-abc");
-        let from_another = derive_task_id("session_id", "sess-abc");
+        let from_one_sample = derive_task_id("session_id", "sess-abc", None);
+        let from_another = derive_task_id("session_id", "sess-abc", None);
         assert_eq!(from_one_sample, from_another);
     }
 
@@ -184,16 +203,16 @@ mod tests {
         // `session_id=abc` and `run_id=abc` are different tasks that happen to
         // share a value; they must not collide.
         assert_ne!(
-            derive_task_id("session_id", "abc"),
-            derive_task_id("run_id", "abc"),
+            derive_task_id("session_id", "abc", None),
+            derive_task_id("run_id", "abc", None),
         );
     }
 
     #[test]
     fn derive_task_id_distinguishes_values() {
         assert_ne!(
-            derive_task_id("session_id", "sess-a"),
-            derive_task_id("session_id", "sess-b"),
+            derive_task_id("session_id", "sess-a", None),
+            derive_task_id("session_id", "sess-b", None),
         );
     }
 
@@ -201,8 +220,29 @@ mod tests {
     fn derive_task_id_sample_fallback_is_per_sample() {
         // With no correlation key, each sample is its own task — today's behaviour.
         assert_ne!(
-            derive_task_id("sample", "hash-a"),
-            derive_task_id("sample", "hash-b"),
+            derive_task_id("sample", "hash-a", None),
+            derive_task_id("sample", "hash-b", None),
+        );
+    }
+
+    #[test]
+    fn derive_task_id_scope_separates_low_entropy_values_across_targets() {
+        // The point of the scope: `run_id=1` from two unrelated systems is two
+        // tasks, not one. Without it they hash identically and merge.
+        assert_ne!(
+            derive_task_id("run_id", "1", Some("target-a")),
+            derive_task_id("run_id", "1", Some("target-b")),
+        );
+        // ...while staying stable within one target, so a task still reassembles
+        // across that target's samples.
+        assert_eq!(
+            derive_task_id("run_id", "1", Some("target-a")),
+            derive_task_id("run_id", "1", Some("target-a")),
+        );
+        // And a scoped id is never the unscoped one.
+        assert_ne!(
+            derive_task_id("run_id", "1", Some("target-a")),
+            derive_task_id("run_id", "1", None),
         );
     }
 
@@ -211,7 +251,7 @@ mod tests {
         // Both are 32 hex chars over the same input in the fallback case, so the
         // domain separator has to keep them apart — otherwise a task id and a
         // trace id could be confused for one another.
-        assert_ne!(derive_task_id("sample", "abc"), derive_trace_id("abc"));
+        assert_ne!(derive_task_id("sample", "abc", None), derive_trace_id("abc"));
     }
 
     #[test]
@@ -247,7 +287,7 @@ mod tests {
         // All these are 32 hex chars; the domain separators must keep them apart.
         let name = "abc";
         let actor = derive_actor_id("agent", name);
-        assert_ne!(actor, derive_task_id("agent", name));
+        assert_ne!(actor, derive_task_id("agent", name, None));
         assert_ne!(actor, derive_trace_id(name));
     }
 

@@ -60,6 +60,26 @@ fn default_limit() -> i64 {
     50
 }
 
+/// Ceiling on rows per page.
+///
+/// Matches `repository::MAX_LIMIT` on `/search`, which enforces its own ceiling
+/// twice over. These two endpoints previously enforced none at all, and they are
+/// the ones backed by a `count_documents` plus a sort the indexes cannot always
+/// serve — so they were the cheapest in the API to abuse.
+const MAX_PAGE_LIMIT: i64 = 500;
+
+/// Clamp a caller-supplied `limit` into something Mongo will honour as written.
+///
+/// Two values are actively dangerous rather than merely large:
+///
+/// * `limit=0` — Mongo's find command reads zero as **no limit**, so the
+///   friendliest-looking value in the API returned the entire collection.
+/// * `limit=-1` — flows into `skip(page * limit as u64)`, where `3 * u64::MAX`
+///   panics in a debug build and wraps in release.
+fn clamp_limit(limit: i64) -> i64 {
+    limit.clamp(1, MAX_PAGE_LIMIT)
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// `GET /api/v1/tasks`
@@ -68,16 +88,17 @@ pub async fn list(
     Query(q): Query<TasksQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let page = if q.page == 0 { 0 } else { q.page - 1 };
+    let limit = clamp_limit(q.limit);
     match s
         .repo
-        .fetch_tasks_page(q.target_id.as_deref(), q.real_boundaries_only, q.limit, page)
+        .fetch_tasks_page(q.target_id.as_deref(), q.real_boundaries_only, limit, page)
         .await
     {
         Ok((records, total)) => Ok(Json(json!({
             "records": records,
             "total":   total,
             "page":    page + 1,
-            "limit":   q.limit,
+            "limit":   limit,
         }))),
         Err(e) => Err(internal(e.to_string())),
     }
@@ -139,16 +160,17 @@ pub async fn actors(
     }
 
     let page = if q.page == 0 { 0 } else { q.page - 1 };
+    let limit = clamp_limit(q.limit);
     match s
         .repo
-        .fetch_actors_page(q.kind.as_deref(), q.task_id.as_deref(), q.limit, page)
+        .fetch_actors_page(q.kind.as_deref(), q.task_id.as_deref(), limit, page)
         .await
     {
         Ok((records, total)) => Ok(Json(json!({
             "records": records,
             "total":   total,
             "page":    page + 1,
-            "limit":   q.limit,
+            "limit":   limit,
         }))),
         Err(e) => Err(internal(e.to_string())),
     }
@@ -169,4 +191,39 @@ fn internal(message: String) -> (StatusCode, Json<Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": message })),
     )
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_does_not_mean_unlimited() {
+        // Mongo's find command reads `limit: 0` as *no limit*, so the
+        // friendliest-looking value in the API returned the whole collection.
+        assert_eq!(clamp_limit(0), 1);
+    }
+
+    #[test]
+    fn a_negative_limit_cannot_reach_the_skip_calculation() {
+        // `skip(page * limit as u64)` turns -1 into u64::MAX, and `3 * u64::MAX`
+        // panics in a debug build.
+        assert_eq!(clamp_limit(-1), 1);
+        assert_eq!(clamp_limit(i64::MIN), 1);
+    }
+
+    #[test]
+    fn a_huge_limit_is_capped() {
+        assert_eq!(clamp_limit(1_000_000), MAX_PAGE_LIMIT);
+        assert_eq!(clamp_limit(i64::MAX), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn ordinary_limits_pass_through_untouched() {
+        assert_eq!(clamp_limit(1), 1);
+        assert_eq!(clamp_limit(default_limit()), 50);
+        assert_eq!(clamp_limit(MAX_PAGE_LIMIT), MAX_PAGE_LIMIT);
+    }
 }

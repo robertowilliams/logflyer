@@ -725,7 +725,11 @@ async fn test_task_accumulates_across_samples() {
     assert_eq!(task["target_ids"].as_array().expect("target_ids").len(), 1);
 
     assert!(task["entity_count"].as_i64().unwrap_or(0) > 0);
-    assert_eq!(task["task_id_source"].as_str(), Some("run_id"));
+    // `session_id`, not `run_id`: the fixture carries run_id on a single line
+    // and session_id throughout, and coverage decides. See
+    // `task_correlator::correlate` for why first-hit-of-highest-rank made the
+    // task id depend on where the sampler cut.
+    assert_eq!(task["task_id_source"].as_str(), Some("session_id"));
     assert!(task["correlation_key"].as_str().is_some());
 }
 
@@ -1443,6 +1447,62 @@ async fn test_search_embeddings_scopes_by_target() {
     assert!(none.hits.is_empty());
     assert_eq!(none.scored, 0);
     assert_eq!(none.skipped, 0);
+}
+
+/// Scoping by target and excluding self must both survive being used together.
+///
+/// The regression: both clauses targeted `sample_hash`, and the filter was built
+/// by two `Document::insert` calls — a map insert, so the target scope silently
+/// replaced the self-exclusion. Every content or behavioral search that passed a
+/// `target_id` therefore returned the query's own sample as hit #1 at score 1.0,
+/// despite `include_self: false`. The two existing tests each exercised one
+/// argument with the other set to `None`, so neither could see it.
+#[tokio::test]
+async fn test_search_embeddings_excludes_self_while_scoped_to_a_target() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    // Two samples on one target, so the scope keeps both and the exclusion has
+    // something left to return.
+    let mine = seed_embeddings(&repo, "hash-emb-020", "tgt-both", "mcp_session.log").await;
+    let sibling = seed_embeddings(&repo, "hash-emb-021", "tgt-both", "langchain_json.log").await;
+    let other = seed_embeddings(&repo, "hash-emb-022", "tgt-other", "mcp_session.log").await;
+
+    let query = repo
+        .fetch_embedding_vector(&mine, EmbeddingKind::Behavioral)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let hits = repo
+        .search_embeddings(
+            EmbeddingKind::Behavioral,
+            &query,
+            10,
+            Some("tgt-both"),
+            Some(&mine),
+        )
+        .await
+        .expect("scoped search excluding self");
+
+    assert!(
+        hits.hits.iter().all(|h| h.sample_hash != mine),
+        "the query's own sample must not come back, got {:?}",
+        hits.hits.iter().map(|h| &h.sample_hash).collect::<Vec<_>>(),
+    );
+    assert!(
+        hits.hits.iter().any(|h| h.sample_hash == sibling),
+        "the other sample on the same target must still be found",
+    );
+    assert!(
+        hits.hits.iter().all(|h| h.sample_hash != other),
+        "and the target scope must still hold",
+    );
 }
 
 /// Content embeddings are off by default, so asking for one must be a clean

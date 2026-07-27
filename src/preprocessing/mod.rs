@@ -44,6 +44,7 @@ pub mod task_correlator;
 pub mod task_intent;
 
 use mongodb::bson::DateTime;
+use tracing::warn;
 
 use crate::config::PreprocessingConfig;
 use crate::models::{ClassificationStatus, LogType, SampleMetadata};
@@ -189,8 +190,23 @@ impl Preprocessor {
         // so `trace_id`, span ids, entity ids and relation ids keep their values.
         let mut entities = entities;
         let task_correlation = if self.config.task_correlation_enabled {
-            let correlation =
-                task_correlator::correlate(content, format.log_type == LogType::Json, sample_hash);
+            let correlation = task_correlator::correlate(
+                content,
+                format.log_type == LogType::Json,
+                sample_hash,
+                target_id,
+            );
+            if !correlation.spanning_keys.is_empty() {
+                // Not an error, but the boundary is coarser than the log could
+                // have supported — worth saying out loud rather than burying.
+                warn!(
+                    sample_hash,
+                    keys = ?correlation.spanning_keys,
+                    chosen = %correlation.source,
+                    "sample spans several values of a correlation key; \
+                     it contains more than one unit of work"
+                );
+            }
             task_correlator::apply(&mut entities, &correlation);
             Some(correlation)
         } else {
@@ -511,8 +527,15 @@ mod tests {
             out.metadata.task_id_source, "sample",
             "langchain carries session_id/run_id, so this must not be a fallback",
         );
-        // run_id outranks session_id — both are present in this fixture.
-        assert_eq!(out.metadata.task_id_source, "run_id");
+        // Both session_id and run_id are present, and `run_id` outranks
+        // `session_id` — but it appears on exactly one line (18, the last) while
+        // `session_id` spans the sample. Coverage decides, so the session wins.
+        //
+        // This is the regression that matters: under first-hit-of-highest-rank a
+        // sample cut at line 17 correlated to the session and one cut at line 18
+        // to the run, so the task id depended on where the sampler cut and two
+        // overlapping samples of one run could never be joined.
+        assert_eq!(out.metadata.task_id_source, "session_id");
 
         let correlation = out.task_correlation.expect("correlation must be returned");
         assert!(correlation.is_real_boundary());
@@ -524,12 +547,49 @@ mod tests {
     }
 
     #[test]
-    fn crewai_fixture_correlates_on_its_own_task_id() {
+    fn crewai_fixture_declines_to_pick_one_of_its_two_tasks() {
         let content = fixture("crewai_logfmt.log");
         let out = Preprocessor::new(default_config()).run("h-crew", "t", &content);
-        // The fixture has both crew_id and task_id; task_id wins.
-        assert_eq!(out.metadata.task_id_source, "task_id");
-        assert!(out.task_correlation.unwrap().is_real_boundary());
+        let correlation = out.task_correlation.expect("correlation must be returned");
+
+        // The fixture genuinely contains two units of work — `task_id=task-1`
+        // (researcher) and `task_id=task-2` (writer, then reviewer). Taking the
+        // first stamped `task-1` onto the second task's events and reported
+        // `is_real_boundary() == true`: a specific, confident, wrong attribution
+        // that then propagated into `actors.task_ids` and the task's
+        // `sample_hashes`.
+        assert_ne!(out.metadata.task_id_source, "task_id");
+        assert_eq!(
+            correlation.spanning_keys,
+            vec!["task_id".to_string()],
+            "the sample must record that it spans several task_id values",
+        );
+
+        // Having declined the key the sample disagrees on, it falls through to
+        // one the whole sample does agree on.
+        assert_eq!(out.metadata.task_id_source, "crew_id");
+        assert!(correlation.is_real_boundary());
+    }
+
+    #[test]
+    fn bedrock_fixture_spans_three_requests_and_says_so() {
+        // Three distinct `request_id`s in one sample. The old first-hit rule
+        // collapsed them onto `req-bedrock-001` silently; the sample must now
+        // report that it spans them rather than picking one.
+        let content = fixture("bedrock_multiline.log");
+        let out = Preprocessor::new(default_config()).run("h-bedrock", "t", &content);
+        let correlation = out.task_correlation.expect("correlation must be returned");
+
+        assert!(
+            correlation.spanning_keys.contains(&"request_id".to_string()),
+            "got {:?}",
+            correlation.spanning_keys,
+        );
+        assert_ne!(out.metadata.task_id_source, "request_id");
+        // Nothing coarser to fall through to, so it says "we could not tell"
+        // instead of asserting a boundary it does not have.
+        assert_eq!(out.metadata.task_id_source, "sample");
+        assert!(!correlation.is_real_boundary());
     }
 
     #[test]
