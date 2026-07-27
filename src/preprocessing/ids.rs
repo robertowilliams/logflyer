@@ -83,6 +83,20 @@ pub fn derive_task_id(key_name: &str, key_value: &str) -> String {
     truncate(sha256_hex(&[key_name, "task", key_value]), 32)
 }
 
+/// 32-hex-char actor ID derived from `(kind, name)`.
+///
+/// Like [`derive_task_id`] and unlike the event ids, this is **deliberately not
+/// keyed on `sample_hash`** — the model `claude-opus-4` is the same agent
+/// wherever it appears, and the tool `web_search` is the same skill. Sharing the
+/// id across samples is what makes "which agents used this skill" answerable at
+/// all; a per-sample actor id would produce one disconnected node per occurrence.
+///
+/// `kind` is part of the hash so an agent and a skill that happen to share a name
+/// remain distinct nodes.
+pub fn derive_actor_id(kind: &str, name: &str) -> String {
+    truncate(sha256_hex(&[kind, "actor", name]), 32)
+}
+
 /// 32-hex-char opaque entity ID derived from the sample's stable identity
 /// plus the line that produced this entity.  `raw_text` is included so two
 /// entities extracted from the same line by different rules can still get
@@ -198,6 +212,43 @@ mod tests {
         // domain separator has to keep them apart — otherwise a task id and a
         // trace id could be confused for one another.
         assert_ne!(derive_task_id("sample", "abc"), derive_trace_id("abc"));
+    }
+
+    #[test]
+    fn derive_actor_id_is_shared_across_samples() {
+        // The defining property: the same actor is one node everywhere, which is
+        // what makes cross-sample "who used what" queries possible.
+        assert_eq!(
+            derive_actor_id("agent", "claude-opus-4"),
+            derive_actor_id("agent", "claude-opus-4"),
+        );
+        assert_eq!(derive_actor_id("agent", "claude-opus-4").len(), 32);
+    }
+
+    #[test]
+    fn derive_actor_id_separates_kinds() {
+        // An agent and a skill sharing a name must not collapse into one node.
+        assert_ne!(
+            derive_actor_id("agent", "search"),
+            derive_actor_id("skill", "search"),
+        );
+    }
+
+    #[test]
+    fn derive_actor_id_distinguishes_names() {
+        assert_ne!(
+            derive_actor_id("skill", "web_search"),
+            derive_actor_id("skill", "file_writer"),
+        );
+    }
+
+    #[test]
+    fn derive_actor_id_does_not_collide_with_other_id_kinds() {
+        // All these are 32 hex chars; the domain separators must keep them apart.
+        let name = "abc";
+        let actor = derive_actor_id("agent", name);
+        assert_ne!(actor, derive_task_id("agent", name));
+        assert_ne!(actor, derive_trace_id(name));
     }
 
     #[test]

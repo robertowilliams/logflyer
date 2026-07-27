@@ -339,6 +339,12 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
       ASSEMBLED_FROM: 'wasDerivedFrom',
       PART_OF:        'wasAttributedTo',
       DELEGATED_TO:   'actedOnBehalfOf',
+      // Stage 12 — event → actor. An event attributed to an agent is literally
+      // PROV's `wasAttributedTo`; invoking a skill or reaching a resource is an
+      // activity consuming something, which is `used`.
+      PERFORMED_BY:      'wasAttributedTo',
+      USED_SKILL:        'used',
+      ACCESSED_RESOURCE: 'used',
     }
     return map[rt] ?? 'wasDerivedFrom'
   }

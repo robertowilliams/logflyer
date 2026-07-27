@@ -190,6 +190,40 @@ export type SemanticRole =
 export type RelationType =
   | 'TRIGGERED_BY' | 'GENERATED' | 'INFORMED' | 'FOLLOWED_BY'
   | 'RESPONDED_TO' | 'ASSEMBLED_FROM' | 'PART_OF' | 'DELEGATED_TO'
+  // Stage 12 — event → actor edges.
+  | 'PERFORMED_BY' | 'USED_SKILL' | 'ACCESSED_RESOURCE'
+
+/** Backend `models::ActorKind` — `#[serde(rename_all = "snake_case")]`. */
+export type ActorKind = 'agent' | 'skill' | 'resource'
+
+/**
+ * Mirror of `models::ActorRecord` — a participant in the interaction graph.
+ *
+ * Deliberately *not* an `EntityRecord`: actors are cross-sample and have no
+ * `line_index` / `span_id` / `raw_text`. A graph traversal can return both, so
+ * anything rendering nodes should branch on which id is present.
+ */
+export interface ActorRecord {
+  actor_id:      string
+  kind:          ActorKind
+  /** The actor's identity as it appears in the log — a model id, tool, or server. */
+  name:          string
+  /** Which field the name came from (`model_id`, `tool_name`, …). */
+  source_field:  string
+  sample_hashes: string[]
+  task_ids:      string[]
+  event_count:   number
+  first_seen:    string
+  last_seen:     string
+}
+
+/** A graph node is either a log event or one of its participants. */
+export type GraphNode = EntityRecord | ActorRecord
+
+/** Narrow a graph node to an actor. Actors carry `actor_id`, events `entity_id`. */
+export function isActor(node: GraphNode): node is ActorRecord {
+  return 'actor_id' in node
+}
 
 /** Backend `models::RelationSource` — `#[serde(rename_all = "snake_case")]`. */
 /** Backend `models::RelationSource` — `#[serde(rename_all = "snake_case")]`.

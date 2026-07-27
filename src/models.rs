@@ -519,6 +519,14 @@ pub enum RelationType {
     AssembledFrom,
     /// Entity belongs to a containing trace / session / run.
     PartOf,
+    /// An event was carried out by an [`ActorKind::Agent`] — a model or a named
+    /// agent. Stage 12.
+    PerformedBy,
+    /// An event invoked an [`ActorKind::Skill`] — a tool or function. Stage 12.
+    UsedSkill,
+    /// An event reached an [`ActorKind::Resource`] — an MCP server or similar.
+    /// Stage 12.
+    AccessedResource,
     /// An agent step delegated work to an MCP server.
     DelegatedTo,
 }
@@ -621,6 +629,75 @@ pub struct RelationEdge {
     pub confidence: f32,
     pub source: RelationSource,
     pub created_at: DateTime,
+}
+
+// ─── ActorRecord ──────────────────────────────────────────────────────────────
+
+/// What kind of participant an [`ActorRecord`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    /// A model or named agent that performs work — `claude-opus-4`, `researcher`.
+    Agent,
+    /// A capability an agent invokes — `web_search`, `file_writer`.
+    Skill,
+    /// Something an agent reaches into — an MCP server, a vector store.
+    Resource,
+}
+
+impl ActorKind {
+    /// The string used in [`crate::preprocessing::ids::derive_actor_id`], and in
+    /// the `actors` collection.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActorKind::Agent => "agent",
+            ActorKind::Skill => "skill",
+            ActorKind::Resource => "resource",
+        }
+    }
+}
+
+/// A participant in the interaction graph — an agent, a skill, or a resource.
+///
+/// **Deliberately not an [`EntityRecord`] variant**, though the plan originally
+/// proposed adding `Agent` / `Skill` / `Resource` to [`EntityType`]. Three reasons:
+///
+/// 1. `otel_builder::build` emits **one OTel span per entity**. Making actors
+///    entities would produce a bogus span for every agent and tool, polluting the
+///    trace waterfall with things that never happened at a point in time.
+/// 2. An `EntityRecord` *is* a parsed log line — it has `raw_text`, `line_index`,
+///    `span_id`, `prov_activity_id`. None of those mean anything for an actor, and
+///    filling them with synthetic values would be lying in the data.
+/// 3. `EntityRecord` is sample-scoped by construction; an actor is deliberately
+///    cross-sample, so that the same agent is one node everywhere.
+///
+/// Stored in the `actors` collection. Edges from events to actors live in
+/// `entity_edges` like any other relation, so graph traversal reaches them
+/// without special handling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorRecord {
+    /// Stable 32-hex-char id derived from `(kind, name)` — shared across every
+    /// sample the actor appears in.
+    pub actor_id: String,
+    pub kind: ActorKind,
+    /// The actor's identity as it appears in the log: a model id, tool name, or
+    /// MCP server id.
+    pub name: String,
+    /// Which field the name came from (`model_id`, `tool_name`, …), so a consumer
+    /// can tell how the actor was identified.
+    pub source_field: String,
+    /// Samples this actor was observed in. Accumulates via `$addToSet`.
+    #[serde(default)]
+    pub sample_hashes: Vec<String>,
+    /// Tasks this actor participated in — the join for "which agents worked on
+    /// tasks like this one".
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    /// How many events referenced this actor, across all samples.
+    #[serde(default)]
+    pub event_count: u32,
+    pub first_seen: DateTime,
+    pub last_seen: DateTime,
 }
 
 // ─── TaskRecord ───────────────────────────────────────────────────────────────

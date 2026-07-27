@@ -43,6 +43,13 @@ pub struct PreprocessingConfig {
     /// Off by default: task correlation changes nothing about existing fields,
     /// but it does start writing a new collection, and that should be opted into.
     pub task_correlation_enabled: bool,
+    /// Switch for stage 12 (actor nodes).  When `false`, no `ActorRecord`s and no
+    /// `PERFORMED_BY` / `USED_SKILL` / `ACCESSED_RESOURCE` edges are produced.
+    ///
+    /// Off by default.  Unlike task correlation this one adds **edges** to
+    /// `entity_edges`, so enabling it changes what an existing graph traversal
+    /// returns — worth opting into deliberately rather than inheriting.
+    pub actor_nodes_enabled: bool,
 }
 
 /// Configuration for the Phase 6 output adapters.
@@ -197,6 +204,7 @@ impl AppConfig {
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(1),
                 task_correlation_enabled: bool_flag("TASK_CORRELATION_ENABLED", false),
+                actor_nodes_enabled: bool_flag("ACTOR_NODES_ENABLED", false),
             },
         })
     }

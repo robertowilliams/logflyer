@@ -188,6 +188,49 @@ curl "http://localhost:8080/api/v1/graph/path?from=$CHILD&to=$PARENT" | jq '{fou
 curl "http://localhost:8080/api/v1/graph/path?from=$PARENT&to=$CHILD" | jq '{found, truncated}'
 ```
 
+### Tasks and actors (Stages 11–12)
+
+Both are off by default. Enable with `TASK_CORRELATION_ENABLED=true` and
+`ACTOR_NODES_ENABLED=true`, then re-run the fixtures.
+
+```bash
+# Which tasks exist, and was each boundary real or a fallback?
+mongosh log_samples --eval '
+  db.tasks.find({}, {_id:0, task_id_source:1, correlation_key:1, sample_hashes:1}).forEach(printjson)'
+
+# The participants, and how far each reaches across samples.
+mongosh log_samples --eval '
+  db.actors.find({}, {_id:0, kind:1, name:1, event_count:1, sample_hashes:1}).forEach(printjson)'
+```
+
+Expected on the bundled fixtures: langchain correlates on `run_id`, crewai on
+`task_id`, bedrock on `request_id`; mcp and react fall back with
+`task_id_source: "sample"` because those logs carry no correlation key. Actors
+span samples — `web_search` is one node across three of them.
+
+**The audit query this exists for** — which events used a given skill, across
+every sample:
+
+```bash
+SKILL=$(mongosh --quiet log_samples --eval 'print(db.actors.findOne({name:"web_search"}).actor_id)')
+curl -s "http://localhost:8080/api/v1/graph/upstream/$SKILL?depth=1" | jq \
+  '{node_count, unresolved_node_ids, edges: [.edges[].relation_type] | unique}'
+```
+
+`unresolved_node_ids` must be **empty**. Actor nodes live in `actors` rather than
+in `sample_metadata.entities`, so traversal resolves both — a non-empty list here
+means an edge is pointing at an actor whose record was never written.
+
+Note actors are deliberately **not** entities: `otel_builder` emits one span per
+entity, so making them entities would fabricate a span for every agent and tool.
+A quick check that this holds — the two counts must match:
+
+```bash
+mongosh log_samples --eval '
+  print(db.otel_spans.countDocuments());
+  printjson(db.sample_metadata.aggregate([{$unwind:"$entities"},{$count:"n"}]).toArray())'
+```
+
 ### Vector search
 
 Embeddings are keyed per **sample**, so this finds similar *samples* — the

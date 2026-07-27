@@ -18,9 +18,12 @@ const ugStore = useUpsidegateStore()
 
 const hash = computed(() => (route.query.hash as string) || '')
 
+// Kept in step with the `RelationType` union by hand — an array literal is not
+// exhaustiveness-checked, unlike the Record<RelationType, …> map in the store.
 const RELATION_TYPES: RelationType[] = [
   'TRIGGERED_BY', 'GENERATED', 'INFORMED', 'FOLLOWED_BY',
   'RESPONDED_TO', 'ASSEMBLED_FROM', 'PART_OF', 'DELEGATED_TO',
+  'PERFORMED_BY', 'USED_SKILL', 'ACCESSED_RESOURCE',
 ]
 
 // Reflects whatever the graph is drawing — the traversal overlay when one is

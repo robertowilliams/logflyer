@@ -24,10 +24,15 @@ use crate::embedding::EmbeddingKind;
 use crate::error::AppError;
 use crate::preprocessing::task_correlator::SAMPLE_FALLBACK;
 use crate::output::vector::{BEHAVIORAL_EMBEDDINGS_COLL, CONTENT_EMBEDDINGS_COLL};
-use crate::models::{ClassificationRecord, ClassificationStatus, SampleMetadata, SampleRecord};
+use crate::models::{
+    ActorRecord, ClassificationRecord, ClassificationStatus, SampleMetadata, SampleRecord,
+};
 
 /// The task index collection (Stage 11).
 pub const TASKS_COLL: &str = "tasks";
+
+/// The actor node collection (Stage 12).
+pub const ACTORS_COLL: &str = "actors";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {
@@ -1361,16 +1366,26 @@ impl MongoRepository {
         let walk = self
             .walk_edges(root, direction, depth, include_structural)
             .await?;
-        let entities = self.fetch_entities_by_ids(&walk.node_ids).await?;
+        // Mixed hydration: since Stage 12 an edge endpoint may be an actor rather
+        // than an event, and both have to resolve or the graph renders unlabelled
+        // nodes for every agent, skill and resource it reaches.
+        let entities = self.fetch_graph_nodes_by_ids(&walk.node_ids).await?;
 
         // Surface nodes that did not resolve to an entity record rather than
         // letting them vanish. With structural edges included this is expected
         // (the trace pseudo-node); without them it means a dangling edge, and
         // silently dropping it would leave the caller wondering why the graph
         // has fewer labels than nodes.
+        // Events are keyed on `entity_id`, actors on `actor_id`. Checking only the
+        // former would report every actor node as unresolved even though it
+        // hydrated perfectly well.
         let resolved: HashSet<&str> = entities
             .iter()
-            .filter_map(|e| e.get("entity_id").and_then(JsonValue::as_str))
+            .filter_map(|e| {
+                e.get("entity_id")
+                    .or_else(|| e.get("actor_id"))
+                    .and_then(JsonValue::as_str)
+            })
             .collect();
         let unresolved_node_ids: Vec<String> = walk
             .node_ids
@@ -1564,6 +1579,209 @@ impl MongoRepository {
             node_ids,
             truncated: reachable.truncated,
         }))
+    }
+
+    // ─── Actors (Stage 12) ────────────────────────────────────────────────────
+
+    /// Upsert an actor, accumulating across samples.
+    ///
+    /// Actors are cross-sample by design — the model `claude-opus-4` is one node
+    /// everywhere — so like tasks this accumulates rather than replaces:
+    /// `$addToSet` unions the samples and tasks it took part in, `$inc` advances
+    /// the reference count, `$max` widens the time window.
+    ///
+    /// `event_delta` should be `0` when re-processing a sample already recorded
+    /// against this actor, for the same reason as [`Self::upsert_task`].
+    pub async fn upsert_actor(
+        &self,
+        actor: &ActorRecord,
+        event_delta: u32,
+    ) -> Result<(), AppError> {
+        self.ensure_actor_indexes().await;
+
+        let col = self.destination_database.collection::<Document>(ACTORS_COLL);
+        let now = DateTime::now();
+
+        let mut add_to_set = doc! {};
+        if let Some(hash) = actor.sample_hashes.first() {
+            add_to_set.insert("sample_hashes", hash);
+        }
+        if let Some(task) = actor.task_ids.first() {
+            add_to_set.insert("task_ids", task);
+        }
+
+        let mut update = doc! {
+            "$setOnInsert": {
+                "actor_id":     &actor.actor_id,
+                "kind":         actor.kind.as_str(),
+                "name":         &actor.name,
+                "source_field": &actor.source_field,
+                "first_seen":   now,
+            },
+            "$inc": { "event_count": event_delta as i64 },
+            "$max": { "last_seen": now },
+        };
+        if !add_to_set.is_empty() {
+            update.insert("$addToSet", add_to_set);
+        }
+
+        col.update_one(
+            doc! { "actor_id": &actor.actor_id },
+            update,
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Whether an actor has already been counted for a given sample.
+    ///
+    /// Guards the `$inc` in [`Self::upsert_actor`] against re-processing, exactly
+    /// as [`Self::task_sample_counted`] does for tasks.
+    pub async fn actor_sample_counted(
+        &self,
+        actor_id: &str,
+        sample_hash: &str,
+    ) -> Result<bool, AppError> {
+        let col = self.destination_database.collection::<Document>(ACTORS_COLL);
+        Ok(col
+            .find_one(
+                doc! { "actor_id": actor_id, "sample_hashes": sample_hash },
+                FindOneOptions::builder().projection(doc! { "_id": 1 }).build(),
+            )
+            .await?
+            .is_some())
+    }
+
+    /// Fetch actors by id.
+    ///
+    /// Used to hydrate actor nodes reached by a graph traversal — see
+    /// [`Self::fetch_graph_nodes_by_ids`].
+    pub async fn fetch_actors_by_ids(
+        &self,
+        actor_ids: &[String],
+    ) -> Result<Vec<JsonValue>, AppError> {
+        if actor_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<&str> = actor_ids.iter().map(String::as_str).collect();
+        let col = self.destination_database.collection::<Document>(ACTORS_COLL);
+
+        let mut cursor = col
+            .find(doc! { "actor_id": { "$in": &ids } }, None)
+            .await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok(out)
+    }
+
+    /// Resolve graph node ids to their records, whichever kind they are.
+    ///
+    /// A traversal walks `entity_edges` without knowing whether a given endpoint
+    /// is an event or an actor — since Stage 12, edges point at both. This looks
+    /// in `sample_metadata.entities` first and then in `actors` for whatever did
+    /// not resolve, so a mixed graph hydrates completely rather than reporting
+    /// actor nodes as unresolved.
+    pub async fn fetch_graph_nodes_by_ids(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<JsonValue>, AppError> {
+        let mut nodes = self.fetch_entities_by_ids(node_ids).await?;
+
+        let resolved: HashSet<&str> = nodes
+            .iter()
+            .filter_map(|e| e.get("entity_id").and_then(JsonValue::as_str))
+            .collect();
+        let missing: Vec<String> = node_ids
+            .iter()
+            .filter(|id| !resolved.contains(id.as_str()))
+            .cloned()
+            .collect();
+
+        if !missing.is_empty() {
+            nodes.extend(self.fetch_actors_by_ids(&missing).await?);
+        }
+        Ok(nodes)
+    }
+
+    /// Page through actors, most recently active first.
+    pub async fn fetch_actors_page(
+        &self,
+        kind: Option<&str>,
+        task_id: Option<&str>,
+        limit: i64,
+        page: u64,
+    ) -> Result<(Vec<JsonValue>, u64), AppError> {
+        let col = self.destination_database.collection::<Document>(ACTORS_COLL);
+
+        let mut filter = Document::new();
+        if let Some(k) = kind {
+            filter.insert("kind", k);
+        }
+        if let Some(t) = task_id {
+            filter.insert("task_ids", t);
+        }
+
+        let total = col.count_documents(filter.clone(), None).await?;
+        let opts = FindOptions::builder()
+            .sort(doc! { "last_seen": -1 })
+            .skip(page * limit as u64)
+            .limit(limit)
+            .build();
+
+        let mut cursor = col.find(filter, opts).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+        }
+        Ok((out, total))
+    }
+
+    /// Indexes for the `actors` collection. Best-effort, like the others.
+    async fn ensure_actor_indexes(&self) {
+        const MARKER: &str = "actors::indexes";
+        {
+            let guard = self.indexed_collections.lock().await;
+            if guard.contains(MARKER) {
+                return;
+            }
+        }
+
+        let col = self.destination_database.collection::<Document>(ACTORS_COLL);
+        let models = vec![
+            IndexModel::builder()
+                .keys(doc! { "actor_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name(Some("actors_unique_actor_id".to_string()))
+                        .unique(Some(true))
+                        .build(),
+                )
+                .build(),
+            // "which agents worked on this task"
+            IndexModel::builder()
+                .keys(doc! { "task_ids": 1 })
+                .options(IndexOptions::builder().name(Some("actors_task_ids".to_string())).build())
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "kind": 1, "last_seen": -1 })
+                .options(IndexOptions::builder().name(Some("actors_kind_last_seen".to_string())).build())
+                .build(),
+        ];
+
+        for model in models {
+            if let Err(e) = col.create_index(model, None).await {
+                warn!(error = %e, "could not create an actors index; queries will scan");
+            }
+        }
+
+        self.indexed_collections
+            .lock()
+            .await
+            .insert(MARKER.to_string());
     }
 
     // ─── Tasks (Stage 11) ─────────────────────────────────────────────────────

@@ -281,9 +281,12 @@ const traversalDepth  = 2
  *  returns the winning chain, so a wider search costs the user nothing. */
 const pathMaxDepth    = 6
 
+// Kept in step with the `RelationType` union by hand — an array literal is not
+// exhaustiveness-checked, unlike the Record<RelationType, …> map in the store.
 const RELATION_TYPES: RelationType[] = [
   'TRIGGERED_BY', 'GENERATED', 'INFORMED', 'FOLLOWED_BY',
   'RESPONDED_TO', 'ASSEMBLED_FROM', 'PART_OF', 'DELEGATED_TO',
+  'PERFORMED_BY', 'USED_SKILL', 'ACCESSED_RESOURCE',
 ]
 
 // Counts whatever the graph is currently drawing — the traversal when one is

@@ -11,12 +11,14 @@ import {
   Plus, Minus, RotateCcw, Crosshair, Maximize2, ExternalLink, X, Copy, Check, CircleDot, Waypoints,
   ArrowUpLeft, ArrowDownRight, Route,
 } from 'lucide-vue-next'
-import type { RelationEdge, EntityRecord } from '../types'
+import type { RelationEdge, GraphNode } from '../types'
+import { isActor } from '../types'
 
 const props = withDefaults(
   defineProps<{
     relations: RelationEdge[]
-    entities: EntityRecord[]
+    /// Events *and* actors — a traversal returns both since Stage 12.
+    entities: GraphNode[]
     expanded?: boolean
   }>(),
   { expanded: false },
@@ -67,13 +69,29 @@ function colorFor(type: string): string {
   return PALETTE[h % PALETTE.length]!
 }
 
-function labelFor(id: string): string {
-  const e = props.entities.find((x) => x.entity_id === id)
-  if (!e) return id.slice(0, 6)
-  return (e.tool_name ?? e.entity_type ?? id).toString().slice(0, 14)
+// A graph node is either a log event or one of its participants (Stage 12).
+// Events are keyed on `entity_id`, actors on `actor_id` — looking up only the
+// former would leave every agent, skill and resource unlabelled and grey.
+function nodeFor(id: string): GraphNode | undefined {
+  return props.entities.find((x) =>
+    isActor(x) ? x.actor_id === id : x.entity_id === id,
+  )
 }
+
+function labelFor(id: string): string {
+  const n = nodeFor(id)
+  if (!n) return id.slice(0, 6)
+  // An actor's name is its identity; an event's is its tool or type.
+  const label = isActor(n) ? n.name : (n.tool_name ?? n.entity_type ?? id)
+  return label.toString().slice(0, 14)
+}
+
+/// Drives the node colour, so actors get their own hues rather than sharing the
+/// event palette.
 function typeFor(id: string): string {
-  return props.entities.find((x) => x.entity_id === id)?.entity_type ?? 'unknown'
+  const n = nodeFor(id)
+  if (!n) return 'unknown'
+  return isActor(n) ? `actor:${n.kind}` : n.entity_type
 }
 
 // ── Build graph from props ────────────────────────────────────────────────────
@@ -307,9 +325,20 @@ const CLICK_MAX_MS = 400
 const RESOLVE_MS = 280
 
 const detailId = ref<string | null>(null)
-const detailEntity = computed(() =>
-  detailId.value ? props.entities.find((e) => e.entity_id === detailId.value) ?? null : null,
+const detailNode = computed<GraphNode | null>(() =>
+  detailId.value ? nodeFor(detailId.value) ?? null : null,
 )
+/// The selected node when it is a log event. `null` for actors, which have a
+/// different shape and their own rows below.
+const detailEntity = computed(() => {
+  const n = detailNode.value
+  return n && !isActor(n) ? n : null
+})
+/// The selected node when it is an actor.
+const detailActor = computed(() => {
+  const n = detailNode.value
+  return n && isActor(n) ? n : null
+})
 // Border color of the data window = the selected node's border color.
 const detailColor = computed(() => {
   const nd = detailId.value ? nodes.value.find((n) => n.id === detailId.value) : null
@@ -529,7 +558,23 @@ onBeforeUnmount(() => {
 })
 
 // Fields shown in the node data window, in order.
+//
+// Actors and events carry entirely different information, so each gets its own
+// row set rather than one union with most fields left blank.
 const detailRows = computed(() => {
+  const a = detailActor.value
+  if (a) {
+    return [
+      { label: 'Kind', value: a.kind },
+      { label: 'Name', value: a.name },
+      { label: 'From field', value: a.source_field },
+      { label: 'Events', value: String(a.event_count) },
+      { label: 'Samples', value: String(a.sample_hashes.length) },
+      { label: 'Tasks', value: String(a.task_ids.length) },
+      { label: 'Actor ID', value: a.actor_id },
+    ]
+  }
+
   const e = detailEntity.value
   if (!e) return [] as { label: string; value: string }[]
   const rows: { label: string; value: string }[] = [
@@ -758,9 +803,11 @@ const detailRows = computed(() => {
       >
         <div class="flex items-center gap-1.5 min-w-0">
           <CircleDot :size="13" class="shrink-0" :style="{ color: detailColor }" />
-          <span class="text-[10px] uppercase tracking-wide text-[rgba(245,245,220,0.4)] shrink-0">Node</span>
+          <span class="text-[10px] uppercase tracking-wide text-[rgba(245,245,220,0.4)] shrink-0">
+            {{ detailActor ? detailActor.kind : 'Node' }}
+          </span>
           <span class="text-xs font-semibold text-[#f5f5dc] truncate">
-            {{ detailEntity?.tool_name ?? detailEntity?.entity_type ?? '—' }}
+            {{ detailActor?.name ?? detailEntity?.tool_name ?? detailEntity?.entity_type ?? '—' }}
           </span>
         </div>
         <button class="text-[rgba(245,245,220,0.45)] hover:text-[#f5f5dc] shrink-0" title="Close" @click="closeDetail">
@@ -791,7 +838,9 @@ const detailRows = computed(() => {
         </button>
       </div>
 
-      <div v-if="detailEntity" class="p-3 space-y-2">
+      <!-- `detailRows` covers both kinds; the event-only blocks below are guarded
+           separately, since an actor has no raw_text or extracted_fields. -->
+      <div v-if="detailEntity || detailActor" class="p-3 space-y-2">
         <dl class="space-y-1.5">
           <div v-for="row in detailRows" :key="row.label" class="flex gap-2 text-xs items-start">
             <dt class="text-[rgba(245,245,220,0.40)] w-20 shrink-0">{{ row.label }}</dt>
@@ -809,6 +858,8 @@ const detailRows = computed(() => {
           </div>
         </dl>
 
+        <!-- Event-only: an actor has no originating log line or fields. -->
+        <template v-if="detailEntity">
         <div v-if="detailEntity.raw_text">
           <div class="flex items-center justify-between mb-1">
             <div class="text-[rgba(245,245,220,0.40)] text-xs">Raw text</div>
@@ -849,9 +900,10 @@ const detailRows = computed(() => {
             </div>
           </div>
         </div>
+        </template>
       </div>
       <div v-else class="p-3 text-xs text-[rgba(245,245,220,0.4)] font-mono break-all">
-        No entity record loaded for {{ detailId }}
+        No record loaded for {{ detailId }}
       </div>
     </div>
 

@@ -477,6 +477,7 @@ async fn run_preprocessing(
     let prov_triples = pipeline_output.prov_triples;
     let otel_spans = pipeline_output.otel_spans;
     let task_correlation = pipeline_output.task_correlation;
+    let actors = pipeline_output.actors;
 
     let worth = metadata.ingestion_hints.worth_classifying;
     let score = metadata.agentic_scan.signal_score;
@@ -505,6 +506,12 @@ async fn run_preprocessing(
             // sample list would have holes in it.
             if let Some(ref correlation) = task_correlation {
                 upsert_task_for_sample(repository, &metadata, correlation).await;
+            }
+
+            // Stage 12: persist the actor nodes. Their edges already travelled
+            // with `metadata.relations` and are written by the graph writer below.
+            if !actors.is_empty() {
+                upsert_actors_for_sample(repository, &metadata.sample_hash, &actors).await;
             }
 
             // Skip the async output adapters when the sample produced fewer
@@ -691,6 +698,46 @@ async fn upsert_task_for_sample(
         new_to_task = !already_counted,
         "folded sample into task"
     );
+}
+
+/// Persist a sample's actor nodes (Stage 12).
+///
+/// Each actor's reference count is only advanced the first time this sample is
+/// recorded against it, for the same reason as tasks: `$addToSet` is idempotent
+/// but `$inc` is not, so a re-run would otherwise keep inflating `event_count`.
+///
+/// Errors are logged per actor and do not abort the rest — a partially recorded
+/// actor set is repaired by the next run of the same sample, whereas failing the
+/// sampling cycle is not.
+async fn upsert_actors_for_sample(
+    repository: &MongoRepository,
+    sample_hash: &str,
+    actors: &[crate::models::ActorRecord],
+) {
+    let mut written = 0usize;
+    for actor in actors {
+        let already = match repository
+            .actor_sample_counted(&actor.actor_id, sample_hash)
+            .await
+        {
+            Ok(counted) => counted,
+            Err(error) => {
+                warn!(error = ?error, actor = %actor.name, "could not check actor membership; skipping");
+                continue;
+            }
+        };
+
+        let delta = if already { 0 } else { actor.event_count };
+        if let Err(error) = repository.upsert_actor(actor, delta).await {
+            warn!(error = ?error, actor = %actor.name, "failed to upsert actor");
+            continue;
+        }
+        written += 1;
+    }
+
+    if written > 0 {
+        info!(sample_hash = %sample_hash, actors = written, "wrote actor nodes");
+    }
 }
 
 /// continues with the next.  All errors are non-fatal.

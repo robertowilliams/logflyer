@@ -27,6 +27,7 @@
 //! wrapping the [`Preprocessor::run`] call inside
 //! `tokio::task::spawn_blocking`.
 
+pub mod actor_extractor;
 pub mod agentic_scanner;
 pub mod entity_extractor;
 pub mod format_detector;
@@ -63,6 +64,10 @@ pub struct PipelineOutput {
     /// correlation is disabled. Carried out separately from `metadata` because the
     /// `tasks` collection is upserted by the caller, not written inline.
     pub task_correlation: Option<task_correlator::TaskCorrelation>,
+    /// Actors and their edges from Stage 12, or `None` when actor nodes are
+    /// disabled. The edges are *also* folded into `metadata.relations`; the
+    /// records are carried here for the caller to persist separately.
+    pub actors: Vec<crate::models::ActorRecord>,
 }
 
 /// Current pipeline version — increment this when the output schema or logic
@@ -186,6 +191,27 @@ impl Preprocessor {
             None
         };
 
+        // ── Stage 12: actor nodes ─────────────────────────────────────────────
+        // Promotes the participants buried in event attributes — model_id,
+        // tool_name, mcp_server_id — into their own nodes, with edges from the
+        // events that involved them.
+        //
+        // Runs after task correlation so actors can record which task they took
+        // part in. The edges join the sample's other relations and are persisted
+        // by the same graph writer; the actor records go to their own collection.
+        let mut relations = relations;
+        let actor_extraction = if self.config.actor_nodes_enabled {
+            let task_id = task_correlation
+                .as_ref()
+                .map(|c| c.task_id.as_str())
+                .unwrap_or("");
+            let extraction = actor_extractor::extract(&entities, sample_hash, task_id);
+            relations.extend(extraction.edges.iter().cloned());
+            Some(extraction)
+        } else {
+            None
+        };
+
         let entity_count = entities.len() as u32;
         let relation_count = relations.len() as u32;
 
@@ -215,7 +241,13 @@ impl Preprocessor {
                 .unwrap_or_default(),
         };
 
-        PipelineOutput { metadata, prov_triples, otel_spans, task_correlation }
+        PipelineOutput {
+            metadata,
+            prov_triples,
+            otel_spans,
+            task_correlation,
+            actors: actor_extraction.map(|x| x.actors).unwrap_or_default(),
+        }
     }
 }
 
@@ -233,6 +265,7 @@ mod tests {
             entity_extraction_enabled: true,
             min_entities_for_persist: 1,
             task_correlation_enabled: true,
+            actor_nodes_enabled: true,
         }
     }
 
@@ -336,6 +369,7 @@ mod tests {
             entity_extraction_enabled: true,
             min_entities_for_persist: 1,
             task_correlation_enabled: true,
+            actor_nodes_enabled: true,
         };
         let preprocessor = Preprocessor::new(config);
         let meta = preprocessor
@@ -578,6 +612,137 @@ mod tests {
         assert!(out.metadata.entities.is_empty());
         assert_eq!(out.metadata.task_id_source, "sample");
         assert_eq!(out.metadata.task_id.len(), 32);
+    }
+
+    // ── Stage 12: actor nodes against real fixtures ──────────────────────────
+
+    #[test]
+    fn openai_fixture_yields_agent_and_skill_nodes() {
+        use crate::models::ActorKind;
+
+        let content = fixture("openai_chat_completions.log");
+        let out = Preprocessor::new(default_config()).run("h-actors", "t", &content);
+
+        assert!(!out.actors.is_empty(), "the fixture names models and tools");
+        assert!(
+            out.actors.iter().any(|a| a.kind == ActorKind::Agent),
+            "a model_id must become an Agent node, got {:?}",
+            out.actors.iter().map(|a| (a.kind, &a.name)).collect::<Vec<_>>(),
+        );
+        assert!(
+            out.actors.iter().any(|a| a.kind == ActorKind::Skill),
+            "a tool_name must become a Skill node",
+        );
+        // Every actor is referenced by at least one event.
+        assert!(out.actors.iter().all(|a| a.event_count > 0));
+    }
+
+    #[test]
+    fn actor_edges_join_the_sample_relations() {
+        use crate::models::RelationType;
+
+        let content = fixture("openai_chat_completions.log");
+        let out = Preprocessor::new(default_config()).run("h-edges", "t", &content);
+
+        let actor_edges: Vec<_> = out
+            .metadata
+            .relations
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.relation_type,
+                    RelationType::PerformedBy
+                        | RelationType::UsedSkill
+                        | RelationType::AccessedResource
+                )
+            })
+            .collect();
+        assert!(!actor_edges.is_empty(), "actor edges must reach metadata.relations");
+
+        // Every actor edge must point at an actor that actually exists, or the
+        // graph gains unlabelled nodes — the failure mode fixed for PART_OF.
+        let actor_ids: std::collections::HashSet<&str> =
+            out.actors.iter().map(|a| a.actor_id.as_str()).collect();
+        for edge in &actor_edges {
+            assert!(
+                actor_ids.contains(edge.target_entity_id.as_str()),
+                "edge targets {} which is not an emitted actor",
+                edge.target_entity_id,
+            );
+        }
+    }
+
+    #[test]
+    fn actors_do_not_become_otel_spans() {
+        // The reason actors are not EntityType variants: otel_builder emits one
+        // span per entity, so actors-as-entities would fabricate a span for every
+        // agent and tool.
+        let content = fixture("openai_chat_completions.log");
+        let out = Preprocessor::new(default_config()).run("h-spans", "t", &content);
+
+        assert!(!out.actors.is_empty(), "fixture must produce actors for this to mean anything");
+        assert_eq!(
+            out.otel_spans.len(),
+            out.metadata.entities.len(),
+            "one span per event, and none for actors",
+        );
+    }
+
+    #[test]
+    fn the_same_actor_is_one_node_across_samples() {
+        let content = fixture("openai_chat_completions.log");
+        let pre = Preprocessor::new(default_config());
+        let a = pre.run("hash-one", "t", &content);
+        let b = pre.run("hash-two", "t", &content);
+
+        let a_ids: std::collections::HashSet<&str> =
+            a.actors.iter().map(|x| x.actor_id.as_str()).collect();
+        let b_ids: std::collections::HashSet<&str> =
+            b.actors.iter().map(|x| x.actor_id.as_str()).collect();
+        assert_eq!(a_ids, b_ids, "actor ids must be stable across samples");
+    }
+
+    #[test]
+    fn actor_nodes_disabled_changes_nothing() {
+        let content = fixture("openai_chat_completions.log");
+        let mut off = default_config();
+        off.actor_nodes_enabled = false;
+        let without = Preprocessor::new(off).run("h-same", "t", &content);
+        let with = Preprocessor::new(default_config()).run("h-same", "t", &content);
+
+        assert!(without.actors.is_empty());
+        assert!(
+            with.metadata.relations.len() > without.metadata.relations.len(),
+            "enabling actors must add edges",
+        );
+        // But it must not disturb the pre-existing ones.
+        let base: Vec<&String> = without.metadata.relations.iter().map(|r| &r.relation_id).collect();
+        let extended: Vec<&String> = with.metadata.relations.iter().map(|r| &r.relation_id).collect();
+        assert!(
+            base.iter().all(|id| extended.contains(id)),
+            "existing relation ids must survive unchanged",
+        );
+        assert_eq!(without.otel_spans.len(), with.otel_spans.len());
+    }
+
+    #[test]
+    fn actors_record_their_task() {
+        let content = fixture("langchain_json.log");
+        let out = Preprocessor::new(default_config()).run("h-at", "t", &content);
+        let task_id = &out.metadata.task_id;
+        assert!(!task_id.is_empty());
+        assert!(
+            out.actors.iter().all(|a| a.task_ids.contains(task_id)),
+            "each actor must record the task it participated in",
+        );
+    }
+
+    #[test]
+    fn nginx_fixture_produces_no_actors() {
+        // No entities, so no participants to promote.
+        let content = fixture("nginx_access.log");
+        let out = Preprocessor::new(default_config()).run("h-nginx-a", "t", &content);
+        assert!(out.actors.is_empty());
     }
 
     #[test]

@@ -60,6 +60,7 @@ fn default_preprocessing_config() -> PreprocessingConfig {
         // at least one entity, so fixtures do not need to be large.
         min_entities_for_persist: 0,
         task_correlation_enabled: true,
+        actor_nodes_enabled: true,
     }
 }
 
@@ -326,15 +327,24 @@ async fn seed_embeddings(
 /// the tests exercise the same serialisation the live pipeline uses.
 async fn seed_graph(repo: &MongoRepository, hash: &str, target: &str, fixture_name: &str) -> SampleMetadata {
     let content = fixture(fixture_name);
-    let metadata = preprocess(hash, target, &content);
-    repo.store_metadata(&metadata).await.expect("store metadata");
+    let out = Preprocessor::new(default_preprocessing_config()).run(hash, target, &content);
+    repo.store_metadata(&out.metadata).await.expect("store metadata");
 
     GraphWriter::new(repo.destination_db())
-        .write_edges(&metadata.relations)
+        .write_edges(&out.metadata.relations)
         .await
         .expect("write edges");
 
-    metadata
+    // Actor edges travel with `metadata.relations`, so the actor *records* have to
+    // be written too — otherwise traversal reaches an id with nothing behind it
+    // and correctly reports a dangling node. The service does both together.
+    for actor in &out.actors {
+        repo.upsert_actor(actor, actor.event_count)
+            .await
+            .expect("upsert actor");
+    }
+
+    out.metadata
 }
 
 /// A bare id and its `ug:entity:` URI form must resolve to the same record,
@@ -819,6 +829,207 @@ async fn test_fetch_tasks_page_can_exclude_fallbacks() {
 
     // Silence the unused warning while keeping the binding meaningful.
     assert!(!fallback.is_real_boundary());
+}
+
+// ─── Actors (Stage 12) ────────────────────────────────────────────────────────
+
+/// Seed a sample's metadata, edges and actor nodes.
+async fn seed_with_actors(
+    repo: &MongoRepository,
+    hash: &str,
+    target: &str,
+    fixture_name: &str,
+) -> (SampleMetadata, Vec<logflayer::models::ActorRecord>) {
+    let content = fixture(fixture_name);
+    let out = Preprocessor::new(default_preprocessing_config()).run(hash, target, &content);
+    repo.store_metadata(&out.metadata).await.expect("store metadata");
+
+    GraphWriter::new(repo.destination_db())
+        .write_edges(&out.metadata.relations)
+        .await
+        .expect("write edges");
+
+    for actor in &out.actors {
+        repo.upsert_actor(actor, actor.event_count)
+            .await
+            .expect("upsert actor");
+    }
+    (out.metadata, out.actors)
+}
+
+/// The property Stage 12 exists for: a traversal from an event must reach its
+/// actors **and hydrate them**, not report them as unresolved.
+///
+/// This is the same failure mode the trace pseudo-node had — an edge pointing at
+/// something the hydration step could not look up.
+#[tokio::test]
+async fn test_traversal_hydrates_actor_nodes() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let (metadata, actors) =
+        seed_with_actors(&repo, "hash-act-001", "tgt-act", "openai_chat_completions.log").await;
+    assert!(!actors.is_empty(), "fixture must produce actors");
+
+    // Start from an event that references an actor.
+    let actor_edge = metadata
+        .relations
+        .iter()
+        .find(|r| format!("{:?}", r.relation_type) == "UsedSkill")
+        .expect("fixture must produce a UsedSkill edge");
+
+    let result = repo
+        .traverse_graph(&actor_edge.source_entity_id, Direction::Downstream, 2, false)
+        .await
+        .expect("traversal");
+
+    assert!(
+        result.node_ids.contains(&actor_edge.target_entity_id),
+        "the traversal must reach the actor",
+    );
+    assert!(
+        result.unresolved_node_ids.is_empty(),
+        "actor nodes must hydrate, not land in unresolved: {:?}",
+        result.unresolved_node_ids,
+    );
+    // And the hydrated record must actually be the actor, keyed on actor_id.
+    assert!(
+        result.entities.iter().any(|e| {
+            e.get("actor_id").and_then(|v| v.as_str()) == Some(actor_edge.target_entity_id.as_str())
+        }),
+        "the actor record must be among the hydrated nodes",
+    );
+}
+
+/// An actor seen in two samples must be one node that accumulates, not two.
+#[tokio::test]
+async fn test_actor_accumulates_across_samples() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let (_, first) =
+        seed_with_actors(&repo, "hash-acc-a", "tgt-acc", "openai_chat_completions.log").await;
+    let (_, second) =
+        seed_with_actors(&repo, "hash-acc-b", "tgt-acc", "openai_chat_completions.log").await;
+
+    let actor_id = &first[0].actor_id;
+    assert!(
+        second.iter().any(|a| &a.actor_id == actor_id),
+        "the same actor must be identified in both samples",
+    );
+
+    let (page, total) = repo.fetch_actors_page(None, None, 100, 0).await.unwrap();
+    assert_eq!(
+        total as usize,
+        first.len(),
+        "the second sample must not create duplicate actor documents",
+    );
+
+    let doc = page
+        .iter()
+        .find(|a| a["actor_id"].as_str() == Some(actor_id.as_str()))
+        .expect("actor must be listed");
+    assert_eq!(
+        doc["sample_hashes"].as_array().unwrap().len(),
+        2,
+        "both samples must be recorded against the actor",
+    );
+}
+
+/// Re-processing must not inflate an actor's reference count.
+#[tokio::test]
+async fn test_reprocessing_does_not_inflate_actor_counts() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let content = fixture("openai_chat_completions.log");
+    let out = Preprocessor::new(default_preprocessing_config()).run("hash-dup-a", "t", &content);
+    let actor = &out.actors[0];
+
+    // First write.
+    repo.upsert_actor(actor, actor.event_count).await.unwrap();
+    let after_first = repo.fetch_actors_page(None, None, 10, 0).await.unwrap().0;
+    let count_first = after_first
+        .iter()
+        .find(|a| a["actor_id"].as_str() == Some(actor.actor_id.as_str()))
+        .unwrap()["event_count"]
+        .as_i64()
+        .unwrap();
+
+    // Re-run: the guard the service applies is `actor_sample_counted`.
+    let counted = repo
+        .actor_sample_counted(&actor.actor_id, "hash-dup-a")
+        .await
+        .unwrap();
+    assert!(counted, "the sample must be recognised as already recorded");
+    repo.upsert_actor(actor, if counted { 0 } else { actor.event_count })
+        .await
+        .unwrap();
+
+    let after_second = repo.fetch_actors_page(None, None, 10, 0).await.unwrap().0;
+    let count_second = after_second
+        .iter()
+        .find(|a| a["actor_id"].as_str() == Some(actor.actor_id.as_str()))
+        .unwrap()["event_count"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(count_second, count_first, "re-processing must not double-count");
+}
+
+/// `fetch_actors_page` must filter by kind and by task.
+#[tokio::test]
+async fn test_fetch_actors_page_filters() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let (metadata, actors) =
+        seed_with_actors(&repo, "hash-filt", "tgt-filt", "openai_chat_completions.log").await;
+
+    let (agents, _) = repo.fetch_actors_page(Some("agent"), None, 50, 0).await.unwrap();
+    assert!(
+        agents.iter().all(|a| a["kind"].as_str() == Some("agent")),
+        "kind filter must be honoured",
+    );
+    assert_eq!(
+        agents.len(),
+        actors
+            .iter()
+            .filter(|a| format!("{:?}", a.kind) == "Agent")
+            .count(),
+    );
+
+    // "which actors worked on this task"
+    let (by_task, _) = repo
+        .fetch_actors_page(None, Some(&metadata.task_id), 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(by_task.len(), actors.len(), "all actors belong to the task");
+
+    let (none, _) = repo
+        .fetch_actors_page(None, Some("task-nope"), 50, 0)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
 }
 
 // ─── Similarity search ────────────────────────────────────────────────────────
