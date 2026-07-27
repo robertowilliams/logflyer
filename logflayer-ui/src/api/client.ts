@@ -5,6 +5,8 @@ import type {
   AdminSettings, SettingsResponse, HistoryEntry,
   SampleMetadata, DeletionRecord, EntityRecord,
   GraphTraversal, GraphPath,
+  TaskRecord, TaskGraph, ActorRecord, ActorKind,
+  EmbeddingKind, SearchResponse,
 } from '../types'
 
 class LogflayerClient {
@@ -197,6 +199,56 @@ class LogflayerClient {
     const { data } = await this.http.get('/api/v1/graph/path', {
       params: { from, to, max_depth: maxDepth },
     })
+    return data
+  }
+
+  // ── Tasks and actors (Stages 11–13) ───────────────────────────────────────
+  // A task is a unit of work that may span several samples, correlated on a key
+  // found in the log itself. `real_boundaries_only` drops the ones that fell
+  // back to sample scope, which are not task boundaries in any useful sense.
+  async getTasks(params: {
+    target_id?: string; real_boundaries_only?: boolean;
+    limit?: number; page?: number
+  }): Promise<PagedResponse<TaskRecord>> {
+    const { data } = await this.http.get('/api/v1/tasks', { params })
+    return data
+  }
+
+  async getTask(taskId: string): Promise<{ task: TaskRecord }> {
+    const { data } = await this.http.get(`/api/v1/tasks/${encodeURIComponent(taskId)}`)
+    return data
+  }
+
+  // The audit payload: every event across the task's samples, the edges between
+  // them, and the participants those edges reach. `truncated` means the task
+  // spans more samples than one response assembles.
+  async getTaskGraph(taskId: string): Promise<TaskGraph> {
+    const { data } = await this.http.get(
+      `/api/v1/tasks/${encodeURIComponent(taskId)}/graph`,
+    )
+    return data
+  }
+
+  async getActors(params: {
+    kind?: ActorKind | ''; task_id?: string;
+    limit?: number; page?: number
+  }): Promise<PagedResponse<ActorRecord>> {
+    const { data } = await this.http.get('/api/v1/actors', {
+      params: { ...params, kind: params.kind || undefined },
+    })
+    return data
+  }
+
+  // ── Vector search ─────────────────────────────────────────────────────────
+  // POST rather than GET: a query vector is 36 or 1536 floats. Pass `task_id`
+  // with `kind: 'task'` to search by what a task was *for* — the first half of
+  // the search-then-audit loop.
+  async searchEmbeddings(body: {
+    sample_hash?: string; task_id?: string; vector?: number[];
+    kind?: EmbeddingKind; limit?: number;
+    target_id?: string; include_self?: boolean
+  }): Promise<SearchResponse & { kind: string; query_dimensions: number; hit_count: number }> {
+    const { data } = await this.http.post('/api/v1/search', body)
     return data
   }
 

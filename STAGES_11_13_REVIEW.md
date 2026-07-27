@@ -286,12 +286,7 @@ Both need a reconciliation path, which is the same work as 2.5.
   sort cap on a large collection.
 - **Unclamped `limit` on `/metadata`, `/relations`, `/prov`, `/spans`** — same
   hole as 1.8, pre-existing, same fix.
-- **No UI surfaces Stages 11 or 13 at all.** There is no client method, route or
-  view for `/tasks`, `/tasks/:id`, `/tasks/:id/graph`, `/actors` or `/search`.
-  Stage 12 is half-visible: `RelationGraph.vue` renders an actor node correctly
-  *if* a traversal happens to reach one, but there is no actor browser and no
-  entry point from a task. The search-then-audit loop these stages were built
-  for cannot be walked from the interface.
+- ~~**No UI surfaces Stages 11 or 13 at all.**~~ **Fixed** — see §4.
 
 ---
 
@@ -329,3 +324,50 @@ The standing rules, reaffirmed:
    uncompiled for eight days behind a green `--lib`.
 4. **A passing test proves the code matches the test's assumption.** Nothing
    more.
+
+---
+
+## 4. The UI the stages were missing
+
+The review found that nothing in the interface reached any of this: no client
+method, route or view for `/tasks`, `/tasks/:id`, `/tasks/:id/graph`, `/actors`
+or `/search`. Stage 12 was half-visible — `RelationGraph.vue` rendered an actor
+node correctly *if* a traversal happened to reach one — and Stages 11 and 13 were
+invisible. The loop the whole design exists for could not be walked.
+
+Two views now close it.
+
+**Task Audit** (`/upsidegate/tasks`) walks the loop end to end: browse tasks →
+read what one was for → find semantically similar tasks → open the interaction
+graph. **Agents & Skills** (`/upsidegate/actors`) browses participants, filterable
+by kind and by task.
+
+Three things are deliberate rather than incidental:
+
+- **`task_id_source` is on every row.** A boundary from `session_id` means
+  something; one from the sample hash only means "we could not tell". Showing
+  them identically would throw away the distinction the audit trail exists to
+  record, so the fallback gets a muted badge and a selected fallback task gets an
+  explicit warning that "task" there means "one sample".
+- **`PART_OF` edges are hidden from the graph, and the count says so.** They
+  target the OTel `trace_id`, which is neither an event nor a participant — on
+  the langchain fixture that is 16 of 42 edges converging on an unlabelled hub
+  captioned `211708`. The server's own `STRUCTURAL_RELATION_TYPES` already
+  excludes them from traversals. Filtered in the store, not the API, so
+  `/tasks/:id/graph` still returns everything.
+- **A task with no embedding is a state, not a failure.** Intents are only
+  embedded when a provider is configured, and a task whose logs never stated a
+  goal has nothing to embed. The view explains that in amber and notes the graph
+  below is still complete; only the semantic lookup is unavailable. The
+  backend's 400 message was also corrected — it called a `task_id` a "sample",
+  which now reaches the operator verbatim.
+
+Verified against a live stack (MongoDB + API + five fixtures ingested with
+`TASK_CORRELATION_ENABLED` and `ACTOR_NODES_ENABLED` on), not just against
+`vue-tsc`. The pipeline logs confirmed the correlation fixes in production
+behaviour — langchain correlating on `session_id`, crewai and bedrock both
+emitting the `spans several values of a correlation key` warning — and a contract
+script checked every field the templates read and every enum literal they switch
+on against the actual payloads. That last check exists because a wrong string
+literal or a missing optional field fails **silently** here: `vue-tsc` cannot see
+it, which is how the PascalCase `EntityType` bug survived for weeks.

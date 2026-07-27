@@ -5,6 +5,7 @@ import type {
   SampleMetadata, EntityRecord, RelationEdge, ProvTriple, OtelSpan,
   EntityType, RelationType, SpanKind, SpanStatusCode,
   GraphTraversal, GraphPath,
+  TaskRecord, TaskGraph, ActorRecord, ActorKind, GraphNode, ScoredHit,
 } from '../types'
 
 export const useUpsidegateStore = defineStore('upsidegate', () => {
@@ -366,6 +367,167 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     }
   }
 
+  // ── Tasks and actors (Stages 11–13) ────────────────────────────────────────
+  // Kept separate from the sample-centric state above: a task is not scoped to a
+  // sample and routinely spans several, which is the whole point of Stage 11.
+
+  const taskList     = ref<TaskRecord[]>([])
+  const taskTotal    = ref(0)
+  const selectedTask = ref<TaskRecord | null>(null)
+  const taskGraph    = ref<TaskGraph | null>(null)
+  const taskLoading  = ref(false)
+  const taskError    = ref<string | null>(null)
+  /** Drop tasks whose boundary was the sample fallback rather than a log key. */
+  const realBoundariesOnly = ref(true)
+
+  const actorList  = ref<ActorRecord[]>([])
+  const actorTotal = ref(0)
+  const filterActorKind = ref<ActorKind | ''>('')
+
+  /** Semantically similar tasks for the selected one. */
+  const similarTasks   = ref<ScoredHit[]>([])
+  const searching      = ref(false)
+  const searchError    = ref<string | null>(null)
+  /** True when the task simply has no embedding yet — not a failure. */
+  const searchUnavailable = ref(false)
+
+  /**
+   * The task graph's nodes, in the shape `RelationGraph` wants.
+   *
+   * Events and actors arrive in separate arrays but are one node set: actor
+   * edges run event → actor, so both endpoints must be resolvable or the
+   * component falls back to rendering a truncated id.
+   */
+  const taskGraphNodes = computed<GraphNode[]>(() =>
+    taskGraph.value ? [...taskGraph.value.entities, ...taskGraph.value.actors] : [],
+  )
+
+  /**
+   * Relation types that group events rather than describe an interaction.
+   *
+   * `PART_OF` targets the OTel `trace_id`, which is neither an event nor a
+   * participant — nothing resolves it, so `RelationGraph` would draw it as an
+   * unlabelled hub with one spoke per event. On the langchain fixture that is 16
+   * of 42 edges converging on a node captioned `211708`, dominating the layout
+   * while saying nothing about who did what.
+   *
+   * It is also redundant here: the task *is* the grouping, and one task can span
+   * several traces. The server's own `graph_query::STRUCTURAL_RELATION_TYPES`
+   * already excludes `PART_OF` from traversals for the same reason; this keeps
+   * the task graph consistent with that.
+   *
+   * Filtered at the presentation layer, not in the API — `/tasks/:id/graph`
+   * still returns every edge, because an auditor may legitimately want the trace
+   * grouping.
+   */
+  const STRUCTURAL_RELATIONS: RelationType[] = ['PART_OF']
+
+  const taskGraphRelations = computed<RelationEdge[]>(() =>
+    taskGraph.value
+      ? taskGraph.value.relations.filter(
+          r => !STRUCTURAL_RELATIONS.includes(r.relation_type),
+        )
+      : [],
+  )
+
+  /** How many edges the filter above hid, so the view can say so. */
+  const taskGraphStructuralCount = computed(() =>
+    taskGraph.value
+      ? taskGraph.value.relations.length - taskGraphRelations.value.length
+      : 0,
+  )
+
+  async function fetchTasks(params: {
+    target_id?: string; real_boundaries_only?: boolean;
+    limit?: number; page?: number
+  }) {
+    try {
+      taskLoading.value = true; taskError.value = null
+      const res = await client.getTasks(params)
+      taskList.value  = res.records
+      taskTotal.value = res.total
+    } catch (e: any) {
+      taskError.value = e.message ?? 'Failed to fetch tasks'
+      taskList.value  = []
+      taskTotal.value = 0
+    } finally {
+      taskLoading.value = false
+    }
+  }
+
+  async function fetchActors(params: {
+    kind?: ActorKind | ''; task_id?: string; limit?: number; page?: number
+  }) {
+    try {
+      taskLoading.value = true; taskError.value = null
+      const res = await client.getActors(params)
+      actorList.value  = res.records
+      actorTotal.value = res.total
+    } catch (e: any) {
+      taskError.value = e.message ?? 'Failed to fetch actors'
+      actorList.value  = []
+      actorTotal.value = 0
+    } finally {
+      taskLoading.value = false
+    }
+  }
+
+  /** Select a task and load its interaction graph — the audit payload. */
+  async function selectTask(task: TaskRecord | null) {
+    selectedTask.value = task
+    taskGraph.value = null
+    similarTasks.value = []
+    searchError.value = null
+    searchUnavailable.value = false
+    if (!task) return
+
+    try {
+      taskLoading.value = true; taskError.value = null
+      taskGraph.value = await client.getTaskGraph(task.task_id)
+    } catch (e: any) {
+      taskError.value = e.response?.data?.error ?? e.message ?? 'Failed to load the task graph'
+    } finally {
+      taskLoading.value = false
+    }
+  }
+
+  /**
+   * Find tasks whose stated intent is semantically close to this one's.
+   *
+   * A task with no `task_embeddings` row yields a 400 from the backend. That is
+   * an expected state, not an error: intents are only embedded when an
+   * embedding provider is configured, and a task whose log never stated a goal
+   * has no intent to embed. Reported through `searchUnavailable` so the view can
+   * explain it rather than showing a raw failure.
+   */
+  async function findSimilarTasks(taskId: string, limit = 10) {
+    try {
+      searching.value = true
+      searchError.value = null
+      searchUnavailable.value = false
+      similarTasks.value = []
+      const res = await client.searchEmbeddings({
+        task_id: taskId, kind: 'task', limit, include_self: false,
+      })
+      similarTasks.value = res.hits
+    } catch (e: any) {
+      const detail: string | undefined = e.response?.data?.error
+      if (e.response?.status === 400) {
+        searchUnavailable.value = true
+        searchError.value = detail ?? 'This task has no intent embedding yet.'
+      } else {
+        searchError.value = detail ?? e.message ?? 'Search failed'
+      }
+    } finally {
+      searching.value = false
+    }
+  }
+
+  function clearTaskError() {
+    taskError.value = null
+    searchError.value = null
+  }
+
   return {
     // state
     metadataList, metadataTotal, selected, loading, error,
@@ -380,6 +542,12 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     expansion, expanding, expansionError, expansionKind,
     graphRelations, graphEntities,
     expandDownstream, expandUpstream, findPath, clearExpansion, resolveEntity,
+    // tasks and actors (Stages 11–13)
+    taskList, taskTotal, selectedTask, taskGraph, taskLoading, taskError,
+    realBoundariesOnly, actorList, actorTotal, filterActorKind,
+    similarTasks, searching, searchError, searchUnavailable,
+    taskGraphNodes, taskGraphRelations, taskGraphStructuralCount,
+    fetchTasks, fetchActors, selectTask, findSimilarTasks, clearTaskError,
     // actions
     fetchMetadata, fetchMetadataByHash, fetchServerOutputs, clearServerOutputs,
     selectMetadata, clearError,

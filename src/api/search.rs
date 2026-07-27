@@ -136,12 +136,24 @@ pub async fn search(
             match s.repo.fetch_embedding_vector(hash, kind).await {
                 Ok(Some(v)) => (v, Some(hash.to_string())),
                 Ok(None) => {
+                    // Name the id for what it is. `kind: "task"` searches by
+                    // `task_id`, so calling it a "sample" was wrong and now
+                    // reaches the operator directly — the frontend renders this
+                    // message verbatim when a task has no embedding yet.
+                    let noun = if kind == EmbeddingKind::Task { "task" } else { "sample" };
+                    let how = if kind == EmbeddingKind::Behavioral {
+                        "Behavioral embeddings are written whenever \
+                         VECTOR_WRITER_ENABLED=true."
+                    } else {
+                        "Content and task embeddings are written by the embedding \
+                         worker, which requires EMBEDDING_ENABLED=true and an API key. \
+                         A task also needs a stated goal in its logs to have an intent \
+                         to embed."
+                    };
                     return Err(bad_request(format!(
-                        "sample {hash} has no {} embedding. Content embeddings require \
-                         EMBEDDING_ENABLED=true and an API key; behavioral ones are written \
-                         whenever VECTOR_WRITER_ENABLED=true.",
+                        "{noun} {hash} has no {} embedding. {how}",
                         kind_str(kind),
-                    )))
+                    )));
                 }
                 Err(e) => return Err(internal(e.to_string())),
             }

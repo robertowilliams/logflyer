@@ -91,6 +91,7 @@ import { useRoute } from 'vue-router'
 import {
   RefreshCw, LayoutDashboard, Target, ScrollText, Radar, Database,
   Brain, Trash2, Settings, Microscope, Share2, Ruler, Radio,
+  ClipboardList, Users,
 } from 'lucide-vue-next'
 import { useLogflayerStore } from './stores/logflayer'
 import vectaLogoUrl from './assets/vectadb-logo.svg'
@@ -116,6 +117,8 @@ const navLinks = [
 ]
 
 const ugNavLinks = [
+  { to: '/upsidegate/tasks',     icon: ClipboardList, label: 'Task Audit'    },
+  { to: '/upsidegate/actors',    icon: Users,         label: 'Agents & Skills' },
   { to: '/upsidegate/entities',  icon: Microscope, label: 'Entity Browser' },
   { to: '/upsidegate/relations', icon: Share2,     label: 'Relation Graph' },
   { to: '/upsidegate/prov',      icon: Ruler,      label: 'PROV-O Triples' },

@@ -455,6 +455,8 @@ export interface SampleMetadata {
  * Returned by `GET /api/v1/tasks` and `GET /api/v1/tasks/:task_id`.
  */
 export interface TaskRecord {
+  /** Mongo `_id`, serialised by the API. Not used for lookups — `task_id` is. */
+  id?:            string
   task_id:        string
   /** See `SampleMetadata.task_id_source`. */
   task_id_source: string

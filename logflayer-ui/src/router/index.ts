@@ -52,6 +52,20 @@ const router = createRouter({
       meta: { title: 'Admin Settings' },
     },
     // ── UpsideGate views ──────────────────────────────────────────────────────
+    // Tasks come first in the group: a task is the unit an audit actually asks
+    // about, and the other views are ways of looking inside one.
+    {
+      path: '/upsidegate/tasks',
+      name: 'ug-tasks',
+      component: () => import('../views/upsidegate/TasksView.vue'),
+      meta: { title: 'Task Audit' },
+    },
+    {
+      path: '/upsidegate/actors',
+      name: 'ug-actors',
+      component: () => import('../views/upsidegate/ActorsView.vue'),
+      meta: { title: 'Agents & Skills' },
+    },
     {
       path: '/upsidegate/entities',
       name: 'ug-entities',
