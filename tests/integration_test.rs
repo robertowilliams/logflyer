@@ -1032,6 +1032,138 @@ async fn test_fetch_actors_page_filters() {
     assert!(none.is_empty());
 }
 
+// ─── Task graph assembly (Phase 4) ────────────────────────────────────────────
+
+/// The audit payload must span **every** sample of the task, not just one.
+///
+/// This is the property that makes the whole task-scoping exercise worthwhile: a
+/// task collected across two log samples must come back as one graph.
+#[tokio::test]
+async fn test_task_graph_spans_every_sample() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    // Two samples of the same session — so one task.
+    let a = seed_graph(&repo, "hash-tg-a", "tgt-tg", "langchain_json.log").await;
+    let b = seed_graph(&repo, "hash-tg-b", "tgt-tg", "langchain_json.log").await;
+    assert_eq!(a.task_id, b.task_id, "precondition: one task, two samples");
+
+    for hash in ["hash-tg-a", "hash-tg-b"] {
+        let out = Preprocessor::new(default_preprocessing_config())
+            .run(hash, "tgt-tg", &fixture("langchain_json.log"));
+        let c = out.task_correlation.unwrap();
+        repo.upsert_task(
+            &c.task_id,
+            &c.source,
+            c.correlation_key.as_deref(),
+            hash,
+            &out.metadata.otel_trace_id,
+            "tgt-tg",
+            out.metadata.entity_count,
+            out.metadata.relation_count,
+        )
+        .await
+        .unwrap();
+    }
+
+    let graph = repo
+        .fetch_task_graph(&a.task_id)
+        .await
+        .expect("fetch graph")
+        .expect("task exists");
+
+    assert_eq!(graph.sample_hashes.len(), 2, "both samples must be in scope");
+    assert!(!graph.truncated);
+
+    // Entities from both samples, not just one.
+    let hashes_seen: std::collections::HashSet<&str> = graph
+        .entities
+        .iter()
+        .filter_map(|e| e["sample_hash"].as_str())
+        .collect();
+    assert_eq!(hashes_seen.len(), 2, "entities must come from both samples");
+    assert_eq!(
+        graph.entities.len(),
+        (a.entity_count + b.entity_count) as usize,
+        "every event across the task must be present",
+    );
+
+    assert!(!graph.relations.is_empty());
+    assert!(!graph.actors.is_empty(), "the participants must be included");
+    assert_eq!(graph.task["task_id"].as_str(), Some(a.task_id.as_str()));
+}
+
+/// The graph must include actor edges *and* the actors they point at, or the
+/// audit shows edges into nothing.
+#[tokio::test]
+async fn test_task_graph_includes_actors_and_their_edges() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    let metadata = seed_graph(&repo, "hash-tga", "tgt-tga", "openai_chat_completions.log").await;
+    let correlation = fold_into_task(&repo, "hash-tga", "tgt-tga", "openai_chat_completions.log").await;
+
+    let graph = repo
+        .fetch_task_graph(&correlation.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let actor_ids: std::collections::HashSet<&str> = graph
+        .actors
+        .iter()
+        .filter_map(|a| a["actor_id"].as_str())
+        .collect();
+    assert!(!actor_ids.is_empty(), "precondition: the fixture yields actors");
+
+    // Every actor edge in the graph must resolve to an actor also in the graph.
+    let actor_edges: Vec<&serde_json::Value> = graph
+        .relations
+        .iter()
+        .filter(|r| {
+            matches!(
+                r["relation_type"].as_str(),
+                Some("PERFORMED_BY") | Some("USED_SKILL") | Some("ACCESSED_RESOURCE")
+            )
+        })
+        .collect();
+    assert!(!actor_edges.is_empty(), "actor edges must be present");
+    for edge in actor_edges {
+        let target = edge["target_entity_id"].as_str().unwrap();
+        assert!(
+            actor_ids.contains(target),
+            "edge points at {target}, which is not among the graph's actors",
+        );
+    }
+
+    assert_eq!(graph.task["task_id"].as_str(), Some(correlation.task_id.as_str()));
+    assert!(!metadata.sample_hash.is_empty());
+}
+
+/// An unknown task id is a clean `None`, which the handler turns into a 404.
+#[tokio::test]
+async fn test_task_graph_for_unknown_task_is_none() {
+    let node = Mongo::default().start().await.expect("start MongoDB container");
+    let host = node.get_host().await.expect("get_host");
+    let port = node.get_host_port_ipv4(27017).await.expect("get_port");
+
+    let repo = MongoRepository::connect(&make_config(&host.to_string(), port).await)
+        .await
+        .expect("connect");
+
+    assert!(repo.fetch_task_graph("no-such-task").await.unwrap().is_none());
+}
+
 // ─── Task intent and task search (Stage 13) ───────────────────────────────────
 //
 // The embedding itself needs an OpenAI key, which CI does not have. These tests

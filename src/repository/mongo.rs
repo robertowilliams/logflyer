@@ -36,6 +36,14 @@ pub const TASKS_COLL: &str = "tasks";
 /// The actor node collection (Stage 12).
 pub const ACTORS_COLL: &str = "actors";
 
+/// Most samples a single task-graph response will assemble.
+///
+/// A task is normally a handful of samples. This exists so that one that has
+/// somehow accumulated thousands — a correlation key reused far more broadly than
+/// intended, say — produces a bounded response flagged `truncated` rather than an
+/// unusable one.
+pub const MAX_TASK_GRAPH_SAMPLES: usize = 500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {
     Inserted,
@@ -1949,6 +1957,110 @@ impl MongoRepository {
         Ok((out, total))
     }
 
+    /// Assemble a task's whole interaction graph, across every sample it spans.
+    ///
+    /// This is the payload an audit opens after a search hit: the events, the
+    /// edges between them, and the participants — agents, skills, resources — for
+    /// one unit of work, however many log samples it was collected in.
+    ///
+    /// Distinct from [`Self::traverse_graph`], which walks outward from a single
+    /// node to a bounded depth. Here the boundary is the task itself, so there is
+    /// no traversal: everything belonging to those samples is in scope.
+    ///
+    /// Bounded by [`MAX_TASK_GRAPH_SAMPLES`]. A task that somehow accumulated
+    /// thousands of samples would otherwise assemble an unusable response; the
+    /// result says `truncated` rather than erroring, matching the traversal
+    /// endpoints.
+    pub async fn fetch_task_graph(&self, task_id: &str) -> Result<Option<TaskGraph>, AppError> {
+        let Some(task) = self.fetch_task(task_id).await? else {
+            return Ok(None);
+        };
+
+        let all_hashes: Vec<String> = task
+            .get("sample_hashes")
+            .and_then(JsonValue::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let truncated = all_hashes.len() > MAX_TASK_GRAPH_SAMPLES;
+        let hashes: Vec<String> = all_hashes
+            .into_iter()
+            .take(MAX_TASK_GRAPH_SAMPLES)
+            .collect();
+
+        if hashes.is_empty() {
+            return Ok(Some(TaskGraph {
+                task,
+                entities: Vec::new(),
+                relations: Vec::new(),
+                actors: Vec::new(),
+                sample_hashes: hashes,
+                truncated,
+            }));
+        }
+
+        let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+
+        // Entities live inside the sample_metadata documents, so unwind them out.
+        let entities = {
+            let col = self
+                .destination_database
+                .collection::<Document>("sample_metadata");
+            let pipeline = vec![
+                doc! { "$match":       { "sample_hash": { "$in": &refs } } },
+                doc! { "$unwind":      "$entities" },
+                doc! { "$replaceRoot": { "newRoot": "$entities" } },
+            ];
+            let mut cursor = col.aggregate(pipeline, None).await?;
+            let mut out = Vec::new();
+            while cursor.advance().await? {
+                out.push(bson_doc_to_json(cursor.deserialize_current()?));
+            }
+            out
+        };
+
+        // Every edge whose sample belongs to the task — including the actor edges
+        // from Stage 12, which is what makes the participants visible.
+        let relations = {
+            let col = self
+                .destination_database
+                .collection::<Document>("entity_edges");
+            let mut cursor = col
+                .find(doc! { "sample_hash": { "$in": &refs } }, None)
+                .await?;
+            let mut out = Vec::new();
+            while cursor.advance().await? {
+                out.push(bson_doc_to_json(cursor.deserialize_current()?));
+            }
+            out
+        };
+
+        // Actors are keyed by task rather than by sample, so this is a direct
+        // lookup rather than a join through the samples.
+        let actors = {
+            let col = self.destination_database.collection::<Document>(ACTORS_COLL);
+            let mut cursor = col.find(doc! { "task_ids": task_id }, None).await?;
+            let mut out = Vec::new();
+            while cursor.advance().await? {
+                out.push(bson_doc_to_json(cursor.deserialize_current()?));
+            }
+            out
+        };
+
+        Ok(Some(TaskGraph {
+            task,
+            entities,
+            relations,
+            actors,
+            sample_hashes: hashes,
+            truncated,
+        }))
+    }
+
     /// Indexes for the `tasks` collection.
     ///
     /// Best-effort like [`Self::ensure_entity_id_index`], since tasks are read on
@@ -2229,6 +2341,24 @@ pub enum PathOutcome {
     NotFound,
     /// Search hit a budget, so no conclusion about reachability is possible.
     Truncated,
+}
+
+/// A task's full interaction graph — the payload an audit inspects.
+#[derive(Debug, Serialize)]
+pub struct TaskGraph {
+    /// The task document itself, including `intent_text` and `task_id_source`.
+    pub task: JsonValue,
+    /// Every event across the task's samples.
+    pub entities: Vec<JsonValue>,
+    /// Every edge, including the Stage 12 event → actor edges.
+    pub relations: Vec<JsonValue>,
+    /// The participants: agents, skills, resources.
+    pub actors: Vec<JsonValue>,
+    /// The samples actually assembled — fewer than the task's full list when
+    /// `truncated`.
+    pub sample_hashes: Vec<String>,
+    /// True when the task spans more samples than the response budget allows.
+    pub truncated: bool,
 }
 
 /// Result of [`MongoRepository::search_embeddings`].

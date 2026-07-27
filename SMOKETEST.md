@@ -282,6 +282,47 @@ ranking, self-exclusion — is covered by integration tests using an injected
 vector. What remains untested is that the model returns a usable vector, which
 needs a real API key.
 
+### The audit loop (Phase 4)
+
+The full path this was all built for — search by what a task was *for*, then open
+the graph of what actually happened:
+
+```bash
+# 1. Browse real task boundaries (excludes one-task-per-sample fallbacks).
+curl -s 'http://localhost:8080/api/v1/tasks?real_boundaries_only=true' \
+  | jq '.records[] | {task_id, task_id_source, intent_text}'
+
+# 2. Find tasks resembling one you care about (needs an embedding provider).
+curl -s -X POST http://localhost:8080/api/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"task_id":"<id>","kind":"task","limit":5}' | jq '.hits[] | {score, task_id}'
+
+# 3. THE AUDIT PAYLOAD — the whole interaction graph for one task.
+curl -s "http://localhost:8080/api/v1/tasks/<id>/graph" \
+  | jq '{sample_count, entity_count, relation_count, actor_count, truncated,
+         intent: .task.intent_text,
+         participants: [.actors[] | {kind, name}]}'
+
+# Who took part, across tasks?
+curl -s 'http://localhost:8080/api/v1/actors?kind=skill' | jq '.records[] | {name, event_count}'
+```
+
+Expected on the bundled fixtures, for the langchain task: 16 entities, 42
+relations, 4 actors (`gpt-4o`, `agent-001`, `calculator`, `search`), intent
+*"I need to search for the current weather"*, and an edge distribution spanning
+`PART_OF`, `FOLLOWED_BY`, `TRIGGERED_BY`, `GENERATED`, `RESPONDED_TO`,
+`PERFORMED_BY` and `USED_SKILL`.
+
+Two things worth knowing:
+
+- **`/tasks/:id/graph` does not traverse.** The task *is* the boundary, so
+  everything belonging to its samples is in scope — no depth parameter. That is
+  the difference from `/graph/{downstream,upstream}`, which walk outward from one
+  node.
+- **`truncated: true`** means the task spans more samples than one response
+  assembles (500). `sample_hashes` then lists the subset actually included, so a
+  caller knows not to read the graph as complete.
+
 ### Vector search
 
 Embeddings are keyed per **sample**, so this finds similar *samples* — the

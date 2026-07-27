@@ -22,6 +22,7 @@ pub mod metadata;
 pub mod prov;
 pub mod relations;
 pub mod search;
+pub mod tasks;
 pub mod samples;
 pub mod spans;
 pub mod targets;
@@ -80,6 +81,13 @@ pub fn build_router(state: ApiState) -> Router {
         // POST rather than GET: a query vector is 36 or 1536 floats, which does
         // not belong in a URL.
         .route("/api/v1/search", post(search::search))
+        // ── Tasks and actors (Stages 11–13) ───────────────────────────────────
+        // `/tasks/:id/graph` is the audit payload: the second half of the loop
+        // that a `kind: "task"` search begins.
+        .route("/api/v1/tasks",                  get(tasks::list))
+        .route("/api/v1/tasks/:task_id",         get(tasks::get_one))
+        .route("/api/v1/tasks/:task_id/graph",   get(tasks::graph))
+        .route("/api/v1/actors",                 get(tasks::actors))
         .route("/api/v1/admin/settings",                  get(admin::get_settings).put(admin::put_settings))
         .route("/api/v1/admin/settings/history",          get(admin::get_settings_history))
         .route("/api/v1/admin/settings/restore/:version", post(admin::post_settings_restore))
