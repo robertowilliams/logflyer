@@ -22,6 +22,18 @@
         <option v-for="t in store.sampleCollections" :key="t" :value="t">{{ t }}</option>
       </select>
 
+      <select
+        v-model="ugStore.filterTaskStatus"
+        class="input w-36"
+        title="What the log shows about whether the work is still running, finished, or failed"
+        @change="loadPage(1)"
+      >
+        <option value="">All statuses</option>
+        <option value="running">Running</option>
+        <option value="completed">Completed</option>
+        <option value="failed">Failed</option>
+      </select>
+
       <button
         :class="[
           'px-3 py-1 rounded-full text-xs font-mono border transition-all',
@@ -65,6 +77,7 @@
         <thead class="bg-[#0f0f0f]">
           <tr class="text-[rgba(245,245,220,0.50)] text-left border-b border-[#dc143c]/20">
             <th class="px-4 py-3">Task</th>
+            <th class="px-4 py-3">Status</th>
             <th class="px-4 py-3">Boundary</th>
             <th class="px-4 py-3">Intent</th>
             <th class="px-4 py-3 text-right">Samples</th>
@@ -75,10 +88,10 @@
         </thead>
         <tbody class="divide-y divide-[#1a1a1a]">
           <tr v-if="ugStore.taskLoading && !ugStore.taskList.length">
-            <td colspan="7" class="px-4 py-6 text-center text-[rgba(245,245,220,0.40)]">Loading…</td>
+            <td colspan="8" class="px-4 py-6 text-center text-[rgba(245,245,220,0.40)]">Loading…</td>
           </tr>
           <tr v-else-if="!ugStore.taskList.length">
-            <td colspan="7" class="px-4 py-8 text-center text-[rgba(245,245,220,0.30)] text-sm">
+            <td colspan="8" class="px-4 py-8 text-center text-[rgba(245,245,220,0.30)] text-sm">
               No tasks
               <span class="block mt-1 text-[rgba(245,245,220,0.20)] text-xs">
                 Task correlation is off by default — set TASK_CORRELATION_ENABLED=true
@@ -94,6 +107,9 @@
             @click="pick(t)"
           >
             <td class="px-4 py-2 font-mono text-[#00d4ff] text-xs">{{ t.task_id.slice(0, 12) }}</td>
+            <td class="px-4 py-2">
+              <span :class="statusClass(t.status)" :title="statusTitle(t.status)">{{ t.status ?? 'running' }}</span>
+            </td>
             <td class="px-4 py-2">
               <span :class="boundaryClass(t.task_id_source)">{{ t.task_id_source }}</span>
               <span
@@ -172,6 +188,10 @@
           <div>
             <span class="text-[rgba(245,245,220,0.40)]">task_id</span><br>
             <span class="text-[#f5f5dc]">{{ ugStore.selectedTask.task_id }}</span>
+          </div>
+          <div>
+            <span class="text-[rgba(245,245,220,0.40)]">status</span><br>
+            <span :class="statusClass(ugStore.selectedTask.status)">{{ ugStore.selectedTask.status ?? 'running' }}</span>
           </div>
           <div>
             <span class="text-[rgba(245,245,220,0.40)]">boundary</span><br>
@@ -345,7 +365,7 @@ import RelationGraph from '../../components/RelationGraph.vue'
 import { client } from '../../api/client'
 import { useLogflayerStore } from '../../stores/logflayer'
 import { useUpsidegateStore } from '../../stores/upsidegate'
-import type { TaskRecord, ActorKind } from '../../types'
+import type { TaskRecord, TaskStatus, ActorKind } from '../../types'
 
 const store   = useLogflayerStore()
 const ugStore = useUpsidegateStore()
@@ -359,6 +379,7 @@ async function loadPage(p: number) {
   await ugStore.fetchTasks({
     target_id: targetId.value || undefined,
     real_boundaries_only: ugStore.realBoundariesOnly,
+    status: ugStore.filterTaskStatus || undefined,
     limit,
     page: page.value,
   })
@@ -409,6 +430,29 @@ function truncate(s: string, n: number) {
 /** The sample fallback is not a real boundary, so it must not look like one. */
 function boundaryClass(source: string) {
   return source === 'sample' ? 'badge badge-slate' : 'badge badge-blue'
+}
+
+/**
+ * Badge colour for a task's status (Stage 14).
+ *
+ * Missing `status` reads the same as `'running'` — a task written before
+ * Stage 14 has no evidence it ended, which is exactly what `running` means —
+ * so it gets the same badge rather than a distinct "unknown" one.
+ */
+function statusClass(status: TaskStatus | undefined) {
+  switch (status ?? 'running') {
+    case 'failed':    return 'badge badge-red'
+    case 'completed': return 'badge badge-green'
+    default:          return 'badge badge-blue'
+  }
+}
+
+function statusTitle(status: TaskStatus | undefined) {
+  switch (status ?? 'running') {
+    case 'failed':    return 'A span in this task reported an error'
+    case 'completed': return 'A terminal marker was seen and nothing errored'
+    default:          return 'No evidence in the log that this task ended'
+  }
 }
 
 function kindClass(kind: ActorKind) {

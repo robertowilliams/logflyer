@@ -1,7 +1,8 @@
-//! Task and actor endpoints (Stages 11–13).
+//! Task and actor endpoints (Stages 11–14).
 //!
 //! | Route | Question |
 //! |---|---|
+//! | `GET /api/v1/tasks?status=running` | what units of work are still active? (Stage 14) |
 //! | `GET /api/v1/tasks` | what units of work do we have? |
 //! | `GET /api/v1/tasks/:task_id` | what was this task, and what was it for? |
 //! | `GET /api/v1/tasks/:task_id/graph` | **the audit payload** — the whole interaction graph |
@@ -21,6 +22,8 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::preprocessing::task_status::TaskStatus;
+
 use super::SharedState;
 
 // ─── Query types ──────────────────────────────────────────────────────────────
@@ -36,6 +39,12 @@ pub struct TasksQuery {
     /// so a caller browsing real units of work usually wants them gone.
     #[serde(default)]
     real_boundaries_only: bool,
+    /// `running`, `completed` or `failed` (Stage 14). Validated in [`list`]
+    /// against [`TaskStatus::parse`] rather than left to the repository, the
+    /// same way `ActorsQuery::kind` is validated in [`actors`] — a typo should
+    /// 400, not silently return zero rows or the whole collection.
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default = "default_limit")]
     limit: i64,
     #[serde(default)]
@@ -87,11 +96,23 @@ pub async fn list(
     State(s): State<SharedState>,
     Query(q): Query<TasksQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let status = match q.status.as_deref() {
+        Some(raw) => match TaskStatus::parse(raw) {
+            Some(status) => Some(status),
+            None => {
+                return Err(bad_request(format!(
+                    "unknown status {raw:?}; expected \"running\", \"completed\" or \"failed\""
+                )))
+            }
+        },
+        None => None,
+    };
+
     let page = if q.page == 0 { 0 } else { q.page - 1 };
     let limit = clamp_limit(q.limit);
     match s
         .repo
-        .fetch_tasks_page(q.target_id.as_deref(), q.real_boundaries_only, limit, page)
+        .fetch_tasks_page(q.target_id.as_deref(), q.real_boundaries_only, status, limit, page)
         .await
     {
         Ok((records, total)) => Ok(Json(json!({

@@ -23,6 +23,7 @@ use crate::config_history;
 use crate::embedding::EmbeddingKind;
 use crate::error::AppError;
 use crate::preprocessing::task_correlator::SAMPLE_FALLBACK;
+use crate::preprocessing::task_status::TaskStatus;
 use crate::output::vector::{
     BEHAVIORAL_EMBEDDINGS_COLL, CONTENT_EMBEDDINGS_COLL, TASK_EMBEDDINGS_COLL,
 };
@@ -1824,6 +1825,7 @@ impl MongoRepository {
         target_id: &str,
         entity_delta: u32,
         relation_delta: u32,
+        status_rank: u8,
     ) -> Result<(), AppError> {
         self.ensure_task_indexes().await;
 
@@ -1850,7 +1852,17 @@ impl MongoRepository {
                 "entity_count":   entity_delta as i64,
                 "relation_count": relation_delta as i64,
             },
-            "$max": { "last_seen": now },
+            // `status_rank` is combined with `$max`, not `$set`, and that choice is
+            // load-bearing. A task spans samples, they are not processed in log
+            // order, and `$set` would make the recorded state depend on whichever
+            // sample happened to arrive last — so a failure could be erased by a
+            // later sample that looked clean. `$max` makes the state monotonic:
+            // 0 running → 1 completed → 2 failed, and never back down. For an
+            // audit, "this task had a failure" is the fact that must survive.
+            //
+            // `last_seen` uses `$max` for the same reason: out-of-order arrival
+            // must not walk the observation window backwards.
+            "$max": { "last_seen": now, "status_rank": status_rank as i32 },
         };
 
         col.update_one(
@@ -1923,7 +1935,8 @@ impl MongoRepository {
         Ok(col
             .find_one(doc! { "task_id": task_id }, None)
             .await?
-            .map(bson_doc_to_json))
+            .map(bson_doc_to_json)
+            .map(with_task_status))
     }
 
     /// Page through tasks, newest activity first.
@@ -1932,10 +1945,15 @@ impl MongoRepository {
     /// fallback — useful because those are not task boundaries in any meaningful
     /// sense, just one-sample-per-task placeholders for logs with no correlation
     /// key.
+    ///
+    /// `status` narrows to one state (Stage 14) — "show me the active tasks" is
+    /// the audit use case the status field exists for. Filtering on `status_rank`
+    /// rather than a derived field keeps this a plain indexed equality match.
     pub async fn fetch_tasks_page(
         &self,
         target_id: Option<&str>,
         real_boundaries_only: bool,
+        status: Option<TaskStatus>,
         limit: i64,
         page: u64,
     ) -> Result<(Vec<JsonValue>, u64), AppError> {
@@ -1948,6 +1966,9 @@ impl MongoRepository {
         if real_boundaries_only {
             filter.insert("task_id_source", doc! { "$ne": SAMPLE_FALLBACK });
         }
+        if let Some(status) = status {
+            filter.insert("status_rank", status.rank() as i32);
+        }
 
         let total = col.count_documents(filter.clone(), None).await?;
         let opts = FindOptions::builder()
@@ -1959,7 +1980,7 @@ impl MongoRepository {
         let mut cursor = col.find(filter, opts).await?;
         let mut out = Vec::new();
         while cursor.advance().await? {
-            out.push(bson_doc_to_json(cursor.deserialize_current()?));
+            out.push(with_task_status(bson_doc_to_json(cursor.deserialize_current()?)));
         }
         Ok((out, total))
     }
@@ -2100,6 +2121,13 @@ impl MongoRepository {
             IndexModel::builder()
                 .keys(doc! { "last_seen": -1 })
                 .options(IndexOptions::builder().name(Some("tasks_last_seen".to_string())).build())
+                .build(),
+            // Serves `?status=` (Stage 14) with the same sort `fetch_tasks_page`
+            // already applies, so "show me the active tasks" does not fall back to
+            // a collection scan.
+            IndexModel::builder()
+                .keys(doc! { "status_rank": 1, "last_seen": -1 })
+                .options(IndexOptions::builder().name(Some("tasks_status_rank_last_seen".to_string())).build())
                 .build(),
         ];
 
@@ -2467,6 +2495,34 @@ fn bson_doc_to_json(doc: Document) -> JsonValue {
         map.insert(key, bson_to_json(v));
     }
     JsonValue::Object(map)
+}
+
+/// Add the human-readable `status` field to a task document (Stage 14).
+///
+/// `tasks` stores only `status_rank`, an integer, because the value is combined
+/// with Mongo's `$max` (see the write side in [`MongoRepository::upsert_task`]).
+/// Callers of the API should not have to know that encoding — this turns the
+/// rank back into the same `running` / `completed` / `failed` vocabulary the
+/// VectaDB ontology admits, via [`TaskStatus::from_rank`]. `status_rank` is left
+/// in place alongside it rather than removed, since it is still useful for
+/// sorting by strength of claim.
+///
+/// A document written before this field existed, or fetched through a path that
+/// projected it away, has no `status_rank` key at all — that reads as `0`
+/// (`Running`), matching the same "no evidence it ended" default the field's
+/// `#[serde(default)]` gives on the write side.
+fn with_task_status(mut json: JsonValue) -> JsonValue {
+    if let JsonValue::Object(ref mut map) = json {
+        let rank = map
+            .get("status_rank")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0) as u8;
+        map.insert(
+            "status".to_string(),
+            JsonValue::String(TaskStatus::from_rank(rank).as_str().to_string()),
+        );
+    }
+    json
 }
 
 fn bson_to_json(v: Bson) -> JsonValue {

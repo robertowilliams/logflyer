@@ -746,6 +746,19 @@ pub struct TaskRecord {
     /// always `None` today.
     #[serde(default)]
     pub intent_text: Option<String>,
+    /// Task state as far as the log shows, stored as a monotonic rank rather than
+    /// a string (Stage 14).
+    ///
+    /// A task spans samples and they are not processed in log order, so the rank
+    /// is combined with `$max`: the recorded state cannot depend on arrival order,
+    /// and a failure once observed is never overwritten by a later sample that
+    /// happened to look clean. Read it through
+    /// [`crate::preprocessing::task_status::TaskStatus::from_rank`].
+    ///
+    /// Defaults to `0` — `Running`, meaning "no evidence it ended" — so documents
+    /// written before this field existed read as active rather than complete.
+    #[serde(default)]
+    pub status_rank: u8,
 }
 
 // ─── SampleMetadata ───────────────────────────────────────────────────────────

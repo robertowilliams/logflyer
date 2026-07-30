@@ -5,7 +5,7 @@ import type {
   SampleMetadata, EntityRecord, RelationEdge, ProvTriple, OtelSpan,
   EntityType, RelationType, SpanKind, SpanStatusCode,
   GraphTraversal, GraphPath,
-  TaskRecord, TaskGraph, ActorRecord, ActorKind, GraphNode, ScoredHit,
+  TaskRecord, TaskStatus, TaskGraph, ActorRecord, ActorKind, GraphNode, ScoredHit,
 } from '../types'
 
 export const useUpsidegateStore = defineStore('upsidegate', () => {
@@ -367,7 +367,7 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     }
   }
 
-  // ── Tasks and actors (Stages 11–13) ────────────────────────────────────────
+  // ── Tasks and actors (Stages 11–14) ────────────────────────────────────────
   // Kept separate from the sample-centric state above: a task is not scoped to a
   // sample and routinely spans several, which is the whole point of Stage 11.
 
@@ -379,6 +379,8 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
   const taskError    = ref<string | null>(null)
   /** Drop tasks whose boundary was the sample fallback rather than a log key. */
   const realBoundariesOnly = ref(true)
+  /** Narrow to one status (Stage 14) — `''` means no filter. */
+  const filterTaskStatus = ref<TaskStatus | ''>('')
 
   const actorList  = ref<ActorRecord[]>([])
   const actorTotal = ref(0)
@@ -438,7 +440,7 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
   )
 
   async function fetchTasks(params: {
-    target_id?: string; real_boundaries_only?: boolean;
+    target_id?: string; real_boundaries_only?: boolean; status?: TaskStatus;
     limit?: number; page?: number
   }) {
     try {
@@ -542,9 +544,9 @@ export const useUpsidegateStore = defineStore('upsidegate', () => {
     expansion, expanding, expansionError, expansionKind,
     graphRelations, graphEntities,
     expandDownstream, expandUpstream, findPath, clearExpansion, resolveEntity,
-    // tasks and actors (Stages 11–13)
+    // tasks and actors (Stages 11–14)
     taskList, taskTotal, selectedTask, taskGraph, taskLoading, taskError,
-    realBoundariesOnly, actorList, actorTotal, filterActorKind,
+    realBoundariesOnly, filterTaskStatus, actorList, actorTotal, filterActorKind,
     similarTasks, searching, searchError, searchUnavailable,
     taskGraphNodes, taskGraphRelations, taskGraphStructuralCount,
     fetchTasks, fetchActors, selectTask, findSimilarTasks, clearTaskError,

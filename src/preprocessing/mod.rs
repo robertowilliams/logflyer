@@ -42,6 +42,7 @@ pub mod semantic_classifier;
 pub mod stats;
 pub mod task_correlator;
 pub mod task_intent;
+pub mod task_status;
 
 use mongodb::bson::DateTime;
 use tracing::warn;
@@ -75,6 +76,10 @@ pub struct PipelineOutput {
     /// which case the task simply has no intent embedding rather than a
     /// misleading one built from an arbitrary line.
     pub task_intent: Option<String>,
+    /// What this sample shows about the task's state (Stage 14). `None` when task
+    /// correlation is off. Combined across a task's samples with `$max` on the
+    /// rank, so it cannot depend on processing order.
+    pub task_status: Option<task_status::TaskStatus>,
 }
 
 /// Current pipeline version — increment this when the output schema or logic
@@ -243,6 +248,17 @@ impl Preprocessor {
             None
         };
 
+        // ── Stage 14: task status ─────────────────────────────────────────────
+        // What the log shows about whether the work is still running, finished,
+        // or failed. Reads the spans for the error signal rather than rescanning
+        // the text, because `otel_builder` already does that carefully.
+        //
+        // Rides with correlation for the same reason as intent: a status is a
+        // property of a task, and without a task there is nothing to attach it to.
+        let task_status = task_correlation
+            .as_ref()
+            .map(|_| task_status::derive(content, &otel_spans));
+
         let entity_count = entities.len() as u32;
         let relation_count = relations.len() as u32;
 
@@ -279,6 +295,7 @@ impl Preprocessor {
             task_correlation,
             actors: actor_extraction.map(|x| x.actors).unwrap_or_default(),
             task_intent,
+            task_status,
         }
     }
 }

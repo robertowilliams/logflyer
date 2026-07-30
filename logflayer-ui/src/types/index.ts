@@ -450,6 +450,13 @@ export interface SampleMetadata {
 }
 
 /**
+ * Backend `preprocessing::task_status::TaskStatus` — `#[serde(rename_all =
+ * "snake_case")]`. Also the exact `Task.status` enum the VectaDB ontology
+ * admits, so this vocabulary is not this app's to extend.
+ */
+export type TaskStatus = 'running' | 'completed' | 'failed'
+
+/**
  * Mirror of `models::TaskRecord` — a unit of work spanning one or more samples.
  *
  * Returned by `GET /api/v1/tasks` and `GET /api/v1/tasks/:task_id`.
@@ -471,6 +478,20 @@ export interface TaskRecord {
   relation_count: number
   first_seen:     string
   last_seen:      string
+  /**
+   * What the log shows about whether the work is still running, finished, or
+   * failed (Stage 14). Derived server-side from `status_rank` — see
+   * `repository::mongo::with_task_status` — so it is always present even
+   * though `status_rank` is what is actually stored.
+   *
+   * Absence (a task written before Stage 14) reads as `'running'`: "no
+   * evidence it ended" is the safe default, not a claim of completion.
+   */
+  status?:        TaskStatus
+  /** The raw monotonic rank `status` was derived from. Rarely needed directly
+   *  — prefer `status` — but kept for callers that want to sort by strength of
+   *  claim the way the repository's `$max` does. */
+  status_rank?:   number
 }
 
 /** Backend `embedding::EmbeddingKind` — `#[serde(rename_all = "snake_case")]`. */

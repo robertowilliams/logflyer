@@ -479,6 +479,7 @@ async fn run_preprocessing(
     let task_correlation = pipeline_output.task_correlation;
     let actors = pipeline_output.actors;
     let task_intent = pipeline_output.task_intent;
+    let task_status = pipeline_output.task_status;
 
     let worth = metadata.ingestion_hints.worth_classifying;
     let score = metadata.agentic_scan.signal_score;
@@ -506,7 +507,17 @@ async fn run_preprocessing(
             // sample was too sparse to warrant graph/vector writes, or the task's
             // sample list would have holes in it.
             if let Some(ref correlation) = task_correlation {
-                upsert_task_for_sample(repository, &metadata, correlation).await;
+                // Stage 14 rides along: the status is derived per sample and
+                // combined monotonically, so it belongs with the same upsert.
+                // `unwrap_or_default()` is Running — "no evidence it ended" — which
+                // is the safe reading when the stage produced nothing.
+                upsert_task_for_sample(
+                    repository,
+                    &metadata,
+                    correlation,
+                    task_status.unwrap_or_default(),
+                )
+                .await;
 
                 // Stage 13: record the goal and embed it, once per task.
                 if let Some(ref intent) = task_intent {
@@ -667,6 +678,7 @@ async fn upsert_task_for_sample(
     repository: &MongoRepository,
     metadata: &crate::models::SampleMetadata,
     correlation: &crate::preprocessing::task_correlator::TaskCorrelation,
+    status: crate::preprocessing::task_status::TaskStatus,
 ) {
     let already_counted = match repository
         .task_sample_counted(&correlation.task_id, &metadata.sample_hash)
@@ -697,6 +709,9 @@ async fn upsert_task_for_sample(
             &metadata.target_id,
             entity_delta,
             relation_delta,
+            // Combined with `$max`, so this raises the recorded state or leaves
+            // it alone — a failure seen in one sample is never erased by another.
+            status.rank(),
         )
         .await
     {

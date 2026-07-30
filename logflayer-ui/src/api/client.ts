@@ -5,7 +5,7 @@ import type {
   AdminSettings, SettingsResponse, HistoryEntry,
   SampleMetadata, DeletionRecord, EntityRecord,
   GraphTraversal, GraphPath,
-  TaskRecord, TaskGraph, ActorRecord, ActorKind,
+  TaskRecord, TaskStatus, TaskGraph, ActorRecord, ActorKind,
   EmbeddingKind, SearchResponse,
 } from '../types'
 
@@ -207,7 +207,7 @@ class LogflayerClient {
   // found in the log itself. `real_boundaries_only` drops the ones that fell
   // back to sample scope, which are not task boundaries in any useful sense.
   async getTasks(params: {
-    target_id?: string; real_boundaries_only?: boolean;
+    target_id?: string; real_boundaries_only?: boolean; status?: TaskStatus;
     limit?: number; page?: number
   }): Promise<PagedResponse<TaskRecord>> {
     const { data } = await this.http.get('/api/v1/tasks', { params })
